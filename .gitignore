@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Test data and results
+exemplsForTests/
+test-result-*.jpg
+test-*.mjs
+
+# Uploads
+uploads/
