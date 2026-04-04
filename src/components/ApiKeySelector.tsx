@@ -11,22 +11,22 @@ export const ApiKeySelector: React.FC<ApiKeySelectorProps> = ({ onKeySelected })
   const [showManualInput, setShowManualInput] = useState(false);
 
   useEffect(() => {
-    // Check if key already exists in env or was previously set
-    const existingKey = (window as any).__GEMINI_API_KEY__ || import.meta.env.VITE_GEMINI_API_KEY;
-    if (existingKey) {
-      setHasKey(true);
-      onKeySelected();
-    } else {
-      setHasKey(false);
-    }
+    // Check if server already has an API key configured
+    fetch('/api/has-gemini-key').then(r => r.json())
+      .then(data => {
+        if (data.hasKey) { setHasKey(true); onKeySelected(); }
+        else { setHasKey(false); }
+      })
+      .catch(() => setHasKey(false));
   }, [onKeySelected]);
 
-  const handleSubmitKey = () => {
-    if (manualKey.trim()) {
-      (window as any).__GEMINI_API_KEY__ = manualKey.trim();
-      setHasKey(true);
-      onKeySelected();
-    }
+  const handleSubmitKey = async () => {
+    if (!manualKey.trim()) return;
+    const res = await fetch('/api/set-gemini-key', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: manualKey.trim() }),
+    });
+    if (res.ok) { setHasKey(true); onKeySelected(); }
   };
 
   const handleSkip = () => {
@@ -37,7 +37,7 @@ export const ApiKeySelector: React.FC<ApiKeySelectorProps> = ({ onKeySelected })
   if (hasKey === true) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-labelledby="api-key-title">
       <div className="bg-[#151619] border border-white/10 rounded-2xl max-w-md w-full p-8 shadow-2xl">
         <div className="flex flex-col items-center text-center space-y-6">
           <div className="w-16 h-16 bg-orange-500/10 rounded-full flex items-center justify-center">
@@ -46,7 +46,7 @@ export const ApiKeySelector: React.FC<ApiKeySelectorProps> = ({ onKeySelected })
 
           <div className="space-y-2">
             <h2 className="text-2xl font-bold text-white uppercase tracking-tight font-mono">
-              API Key Setup
+              <span id="api-key-title">API Key Setup</span>
             </h2>
             <p className="text-gray-400 text-sm leading-relaxed">
               Enter a Gemini API key for AI features, or skip to use deterministic focus stacking only.
@@ -62,6 +62,7 @@ export const ApiKeySelector: React.FC<ApiKeySelectorProps> = ({ onKeySelected })
                 onKeyDown={(e) => e.key === 'Enter' && handleSubmitKey()}
                 placeholder="Paste your Gemini API key..."
                 className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white text-sm placeholder:text-gray-600 focus:outline-none focus:border-orange-500/50 transition-colors"
+                aria-label="Gemini API key"
                 autoFocus
               />
               <div className="flex space-x-3">

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Camera, Layers, Sparkles, Info, Github, ExternalLink, Cpu } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { ApiKeySelector } from './components/ApiKeySelector';
 import { RawUploader } from './components/RawUploader';
 import { PackshotGenerator } from './components/PackshotGenerator';
@@ -30,6 +31,7 @@ export default function App() {
   }, []);
 
   return (
+    <ErrorBoundary>
     <div className="min-h-screen bg-[#0a0b0d] text-gray-300 font-sans selection:bg-orange-500/30 selection:text-orange-200">
       <ApiKeySelector onKeySelected={() => setIsKeySelected(true)} />
 
@@ -62,7 +64,7 @@ export default function App() {
             </button>
             <button
               onClick={() => {
-                delete (window as any).__GEMINI_API_KEY__;
+                fetch('/api/reset-gemini-key', { method: 'POST' });
                 setIsKeySelected(false);
               }}
               className="text-xs font-mono uppercase tracking-widest text-orange-500 hover:text-orange-400 transition-colors"
@@ -201,5 +203,6 @@ export default function App() {
         </div>
       </footer>
     </div>
+    </ErrorBoundary>
   );
 }

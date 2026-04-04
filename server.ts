@@ -1,6 +1,6 @@
 /**
- * Express backend — handles RAW/PSD upload/extraction, focus stacking, and multi-format export.
- * API routes: /api/process-raw, /api/focus-stack, /api/export.
+ * Express backend — handles RAW/PSD upload/extraction, focus stacking, multi-format export,
+ * and proxies Gemini API calls so API keys never reach the client bundle.
  */
 
 import express from "express";
@@ -9,11 +9,21 @@ import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import pino from "pino";
 import sharp from "sharp";
 // @ts-ignore — librawspeed types declare module as "libraw"
 import LibRaw from "librawspeed";
+import { GoogleGenAI } from "@google/genai";
 import { readPsd, writePsdBuffer, initializeCanvas } from "ag-psd";
 import { performFocusStack } from "./src/lib/focus-stack.js";
+
+/** Structured logger — JSON output, request tracking. */
+const log = pino({
+  level: process.env.NODE_ENV === 'production' ? 'info' : 'debug',
+  transport: process.env.NODE_ENV !== 'production' ? { target: 'pino-pretty', options: { colorize: true } } : undefined,
+});
 
 /** Initialize ag-psd for Node.js — canvas factory that stores pixel data in memory. */
 initializeCanvas(
@@ -53,34 +63,71 @@ const RAW_EXTENSIONS = new Set([
 sharp.cache(false);
 sharp.concurrency(1);
 
-console.log("SERVER STARTING AT", new Date().toISOString());
+/** File magic bytes for validation — reject spoofed extensions. */
+const MAGIC_BYTES: Record<string, Buffer[]> = {
+  jpeg: [Buffer.from([0xFF, 0xD8])],
+  png: [Buffer.from([0x89, 0x50, 0x4E, 0x47])],
+  tiff: [Buffer.from([0x49, 0x49, 0x2A, 0x00]), Buffer.from([0x4D, 0x4D, 0x00, 0x2A])], // Little/big endian
+  psd: [Buffer.from([0x38, 0x42, 0x50, 0x53])], // "8BPS"
+  riff: [Buffer.from([0x52, 0x49, 0x46, 0x46])], // RIFF container (some RAW formats)
+};
+
+/** Validate that file content matches expected format based on magic bytes. */
+function validateFileMagic(buffer: Buffer, ext: string): boolean {
+  // RAW formats use TIFF container (CR2, NEF, ARW, DNG, ORF, PEF, etc.)
+  if (RAW_EXTENSIONS.has(ext)) {
+    const hasTiff = MAGIC_BYTES.tiff.some(m => buffer.subarray(0, m.length).equals(m));
+    const hasRiff = MAGIC_BYTES.riff.some(m => buffer.subarray(0, m.length).equals(m));
+    const hasFuji = buffer.subarray(0, 8).toString('ascii').startsWith('FUJIFILM'); // RAF
+    const hasPana = buffer.length > 20; // RW2 has various headers — trust extension for Panasonic
+    return hasTiff || hasRiff || hasFuji || hasPana;
+  }
+  if (ext === '.psd' || ext === '.psb') {
+    return MAGIC_BYTES.psd.some(m => buffer.subarray(0, m.length).equals(m));
+  }
+  return true; // Unknown extension — let Sharp try to decode
+}
+
+log.info('Server starting');
 
 async function startServer() {
   try {
     const app = express();
     const PORT = 3000;
 
-  app.use(cors());
+  // Security headers — disable crossOriginEmbedderPolicy for WASM compatibility
+  app.use(helmet({ crossOriginEmbedderPolicy: false }));
+
+  // CORS — restrict to explicit origins in production
+  const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'];
+  app.use(cors({
+    origin: process.env.NODE_ENV === 'production' ? allowedOrigins : true,
+    credentials: true,
+  }));
+
   app.use(express.json({ limit: '100mb' }));
   app.use(express.urlencoded({ limit: '100mb', extended: true }));
-  
-  // Logging middleware
+
+  // Rate limiting
+  const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
+  const uploadLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Upload rate limit exceeded' } });
+  const stackLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, message: { error: 'Processing rate limit exceeded' } });
+  app.use('/api', apiLimiter);
+
+  // Request logging middleware
   app.use((req, res, next) => {
-    const contentLength = req.headers['content-length'];
-    const sizeStr = contentLength ? ` (${(parseInt(contentLength) / (1024 * 1024)).toFixed(2)} MB)` : '';
-    console.log(`${new Date().toISOString()} - ${req.method} ${req.url}${sizeStr}`);
-    
-    // Prevent caching of API responses
+    const start = Date.now();
+    res.on('finish', () => {
+      log.info({ method: req.method, url: req.url, status: res.statusCode, ms: Date.now() - start }, 'request');
+    });
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-    
     next();
   });
 
-  // API Ping
-  app.get("/api/ping", (req, res) => {
-    console.log("Ping received");
+  // Health check
+  app.get("/api/ping", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
@@ -107,17 +154,17 @@ async function startServer() {
   });
 
   // Extract preview from any RAW format via librawspeed, fallback to Sharp for non-RAW
-  app.post("/api/process-raw", (req, res, next) => {
-    console.log("Processing /api/process-raw request...");
+  app.post("/api/process-raw", uploadLimiter, (req, res, next) => {
+    log.debug('Processing /api/process-raw request');
     upload.single("images")(req, res, (err) => {
       if (err) {
-        console.error("Multer error:", err);
+        log.error({ err }, 'Multer error');
         return res.status(400).json({
           error: `Upload error: ${err.message}`,
           code: err.code
         });
       }
-      console.log("File received:", req.file ? req.file.originalname : "none");
+      log.debug({ file: req.file?.originalname }, 'File received');
       next();
     });
   }, async (req, res) => {
@@ -132,10 +179,16 @@ async function startServer() {
       const ext = path.extname(file.originalname).toLowerCase();
       const isRAW = RAW_EXTENSIONS.has(ext);
       const isPSD = ext === '.psd' || ext === '.psb';
-      console.log(`Processing file: ${file.originalname}, size: ${file.size} bytes, RAW: ${isRAW}, PSD: ${isPSD}`);
+      log.info({ file: file.originalname, size: file.size, isRAW, isPSD }, 'Processing file');
 
       try {
         const buffer = fs.readFileSync(filePath);
+
+        // Validate file magic bytes match claimed extension
+        if (!validateFileMagic(buffer, ext)) {
+          throw new Error(`File content doesn't match extension ${ext}. Possible corrupted or spoofed file.`);
+        }
+
         let previewBuffer: Buffer | null = null;
 
         // PSD: read composite or flatten layers into JPEG via ag-psd + Sharp
@@ -147,7 +200,7 @@ async function startServer() {
               previewBuffer = await sharp(Buffer.from(psd.imageData.data.buffer), {
                 raw: { width: psd.imageData.width, height: psd.imageData.height, channels: 4 },
               }).jpeg({ quality: 90 }).toBuffer();
-              console.log(`[PSD COMPOSITE] Success for ${file.originalname}, size: ${previewBuffer.length}`);
+              log.info(`[PSD COMPOSITE] Success for ${file.originalname}, size: ${previewBuffer.length}`);
             } else {
               // No composite — try first layer with pixel data
               const psd2 = readPsd(buffer, { useImageData: true, skipCompositeImageData: true });
@@ -156,11 +209,11 @@ async function startServer() {
                 previewBuffer = await sharp(Buffer.from(layer.imageData.data.buffer), {
                   raw: { width: layer.imageData.width, height: layer.imageData.height, channels: 4 },
                 }).jpeg({ quality: 90 }).toBuffer();
-                console.log(`[PSD LAYER] Success from layer "${layer.name}" for ${file.originalname}`);
+                log.info(`[PSD LAYER] Success from layer "${layer.name}" for ${file.originalname}`);
               }
             }
           } catch (e: any) {
-            console.log(`[PSD] Failed for ${file.originalname}: ${e.message}`);
+            log.info(`[PSD] Failed for ${file.originalname}: ${e.message}`);
           }
         }
 
@@ -173,10 +226,10 @@ async function startServer() {
             const thumbResult = await lr.createThumbnailJPEGBuffer();
             if (thumbResult?.success && thumbResult.buffer?.length > 10000) {
               previewBuffer = thumbResult.buffer;
-              console.log(`[LIBRAW THUMB] Success for ${file.originalname}, size: ${previewBuffer.length}`);
+              log.info(`[LIBRAW THUMB] Success for ${file.originalname}, size: ${previewBuffer.length}`);
             }
           } catch (e: any) {
-            console.log(`[LIBRAW THUMB] Failed for ${file.originalname}: ${e.message}`);
+            log.info(`[LIBRAW THUMB] Failed for ${file.originalname}: ${e.message}`);
           }
 
           // Strategy 2: LibRaw full RAW decode to JPEG (slower but works if no embedded thumb)
@@ -186,10 +239,10 @@ async function startServer() {
               const jpegResult = await lr.createJPEGBuffer({ quality: 90 });
               if (jpegResult?.success && jpegResult.buffer?.length > 10000) {
                 previewBuffer = jpegResult.buffer;
-                console.log(`[LIBRAW DECODE] Success for ${file.originalname}, size: ${previewBuffer.length}`);
+                log.info(`[LIBRAW DECODE] Success for ${file.originalname}, size: ${previewBuffer.length}`);
               }
             } catch (e: any) {
-              console.log(`[LIBRAW DECODE] Failed for ${file.originalname}: ${e.message}`);
+              log.info(`[LIBRAW DECODE] Failed for ${file.originalname}: ${e.message}`);
             }
           }
           lr.close();
@@ -199,9 +252,9 @@ async function startServer() {
         if (!previewBuffer) {
           try {
             previewBuffer = await sharp(buffer).jpeg({ quality: 90 }).toBuffer();
-            console.log(`[SHARP] Direct decode success for ${file.originalname}, size: ${previewBuffer.length}`);
+            log.info(`[SHARP] Direct decode success for ${file.originalname}, size: ${previewBuffer.length}`);
           } catch (e: any) {
-            console.log(`[SHARP] Direct decode failed for ${file.originalname}: ${e.message}`);
+            log.info(`[SHARP] Direct decode failed for ${file.originalname}: ${e.message}`);
           }
         }
 
@@ -216,7 +269,7 @@ async function startServer() {
           .jpeg({ quality: 80, mozjpeg: true })
           .toBuffer();
 
-        console.log(`Optimized ${file.originalname}: ${previewBuffer.length} → ${optimized.length} bytes`);
+        log.info(`Optimized ${file.originalname}: ${previewBuffer.length} → ${optimized.length} bytes`);
 
         processedImages.push({
           name: file.originalname,
@@ -224,7 +277,7 @@ async function startServer() {
           mimeType: "image/jpeg"
         });
       } catch (err: any) {
-        console.error(`Error processing ${file.originalname}:`, err);
+        log.error({ err, file: file.originalname }, 'Error processing file');
         processedImages.push({
           name: file.originalname,
           error: err.message || "Failed to process file"
@@ -244,7 +297,7 @@ async function startServer() {
       }
       res.json({ images: processedImages });
     } catch (error: any) {
-      console.error("Processing error:", error);
+      log.error({ err: error }, 'Processing error');
       if (!res.headersSent) {
         res.status(500).json({ error: "Internal server error during processing", details: error.message });
       }
@@ -323,7 +376,7 @@ async function startServer() {
       res.setHeader('Content-Disposition', `attachment; filename=packshot-${timestamp}.${extension}`);
       res.send(outputBuffer);
     } catch (error: any) {
-      console.error(`Export error (${req.body?.format}):`, error);
+      log.error({ err: error, format: req.body?.format }, 'Export error');
       res.status(500).json({ error: `Failed to export as ${req.body?.format || 'tiff'}`, details: error.message });
     }
   });
@@ -335,7 +388,7 @@ async function startServer() {
   });
 
   // Deterministic focus stacking — OpenCV alignment + multi-scale compositing, no LLM
-  app.post("/api/focus-stack", async (req, res) => {
+  app.post("/api/focus-stack", stackLimiter, async (req, res) => {
     const startTime = Date.now();
     try {
       const { images, options } = req.body;
@@ -354,13 +407,13 @@ async function startServer() {
         });
       }
 
-      console.log(`[focus-stack] Starting with ${images.length} images, options:`, options || 'defaults');
+      log.info({ imageCount: images.length, options: options || 'defaults' }, 'Focus stack starting');
       const result = await performFocusStack(images, options);
-      console.log(`[focus-stack] Done in ${Date.now() - startTime}ms`);
+      log.info(`[focus-stack] Done in ${Date.now() - startTime}ms`);
 
       res.json(result);
     } catch (error: any) {
-      console.error("[focus-stack] Error:", error);
+      log.error({ err: error }, 'Focus stack error');
       if (!res.headersSent) {
         res.status(500).json({
           error: error.message || "Focus stacking failed",
@@ -370,15 +423,152 @@ async function startServer() {
     }
   });
 
+  // ── Gemini API key management — key stays server-side in memory ─────────
+
+  /** Runtime API key — set via env or user input, never sent to client. */
+  let geminiApiKey = process.env.GEMINI_API_KEY || '';
+
+  app.get("/api/has-gemini-key", (_req, res) => {
+    res.json({ hasKey: !!geminiApiKey });
+  });
+
+  app.post("/api/set-gemini-key", (req, res) => {
+    const { key } = req.body;
+    if (!key || typeof key !== 'string' || key.length < 10) {
+      return res.status(400).json({ error: 'Invalid API key' });
+    }
+    geminiApiKey = key;
+    log.info('Gemini API key set via UI');
+    res.json({ success: true });
+  });
+
+  app.post("/api/reset-gemini-key", (_req, res) => {
+    geminiApiKey = '';
+    log.info('Gemini API key reset');
+    res.json({ success: true });
+  });
+
+  // ── Gemini AI proxy endpoints — API key stays server-side only ─────────
+
+  /** Get Gemini client using server-side key. */
+  const getGeminiAI = () => {
+    if (!geminiApiKey) throw new Error('GEMINI_API_KEY not configured. Enter a key or set GEMINI_API_KEY env var.');
+    return new GoogleGenAI({ apiKey: geminiApiKey });
+  };
+
+  /** Generate studio packshot via Gemini — pure white bg, zero creativity. */
+  app.post("/api/generate-packshot", stackLimiter, async (req, res) => {
+    try {
+      const { images } = req.body;
+      if (!images?.length) return res.status(400).json({ error: 'No images provided' });
+
+      const ai = getGeminiAI();
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-image-preview',
+        contents: {
+          parts: [
+            { text: 'Generate a professional, commercial-grade packshot of the product shown in these images. Follow the system instructions strictly: PURE WHITE background, ZERO creativity, EXACT product fidelity. Create ONE high-quality "Hero Shot" that represents the product perfectly.' },
+            ...images.map((img: any) => ({ inlineData: { data: img.base64, mimeType: img.mimeType } })),
+          ],
+        },
+        config: {
+          systemInstruction: 'YOU ARE A TECHNICAL PRODUCT PHOTOGRAPHY SYNTHESIS ENGINE. STRICT REQUIREMENTS: 1. BACKGROUND: ABSOLUTE PURE WHITE (#FFFFFF). 2. FIDELITY: IDENTICAL REPLICA OF SOURCE. 3. CREATIVITY: ZERO. 4. LIGHTING: EVEN STUDIO. 5. COMPOSITION: CENTERED, SHARP FOCUS.',
+          imageConfig: { aspectRatio: '1:1', imageSize: '1K' },
+        },
+      });
+
+      for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData) {
+          return res.json({ image: `data:image/png;base64,${part.inlineData.data}` });
+        }
+      }
+      res.status(500).json({ error: 'No image generated' });
+    } catch (error: any) {
+      log.error({ err: error }, 'Generate packshot error');
+      const status = error.message?.includes('API_KEY') || error.message?.includes('not found') ? 401 : 500;
+      res.status(status).json({ error: error.message || 'Generation failed' });
+    }
+  });
+
+  /** Homogenize lighting — reduce burnt highlights, lift shadows. */
+  app.post("/api/homogenize", stackLimiter, async (req, res) => {
+    try {
+      const { currentImage, sourceImages, burnt = 15, dark = 15 } = req.body;
+      if (!currentImage || !sourceImages?.length) return res.status(400).json({ error: 'Missing image data' });
+
+      const ai = getGeminiAI();
+      const currentBase64 = currentImage.replace(/^data:image\/\w+;base64,/, '');
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-image-preview',
+        contents: {
+          parts: [
+            { text: `Apply lighting homogenization: reduce overexposed highlights by ${burnt}%, lift underexposed shadows by ${dark}%. Maintain product fidelity and pure white background.` },
+            { inlineData: { data: currentBase64, mimeType: 'image/png' } },
+            ...sourceImages.map((img: any) => ({ inlineData: { data: img.base64, mimeType: img.mimeType } })),
+          ],
+        },
+        config: {
+          systemInstruction: 'YOU ARE A TECHNICAL PRODUCT PHOTOGRAPHY LIGHTING SPECIALIST. Normalize lighting. Maintain product fidelity. Keep background pure white.',
+          imageConfig: { aspectRatio: '1:1', imageSize: '1K' },
+        },
+      });
+
+      for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData) {
+          return res.json({ image: `data:image/png;base64,${part.inlineData.data}` });
+        }
+      }
+      res.status(500).json({ error: 'No image generated' });
+    } catch (error: any) {
+      log.error({ err: error }, 'Homogenize error');
+      res.status(500).json({ error: error.message || 'Homogenization failed' });
+    }
+  });
+
+  /** Targeted edit via user prompt — change color, remove label, etc. */
+  app.post("/api/edit-packshot", stackLimiter, async (req, res) => {
+    try {
+      const { currentImage, sourceImages, prompt } = req.body;
+      if (!currentImage || !prompt) return res.status(400).json({ error: 'Missing image or prompt' });
+
+      const ai = getGeminiAI();
+      const currentBase64 = currentImage.replace(/^data:image\/\w+;base64,/, '');
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-image-preview',
+        contents: {
+          parts: [
+            { text: `Apply this specific modification: "${prompt}". Only change what's requested. Maintain product fidelity and pure white background.` },
+            { inlineData: { data: currentBase64, mimeType: 'image/png' } },
+            ...(sourceImages || []).map((img: any) => ({ inlineData: { data: img.base64, mimeType: img.mimeType } })),
+          ],
+        },
+        config: {
+          systemInstruction: 'YOU ARE A TECHNICAL PRODUCT PHOTOGRAPHY EDITOR. Apply ONLY the requested change. Maintain fidelity for everything else. Keep background pure white.',
+          imageConfig: { aspectRatio: '1:1', imageSize: '1K' },
+        },
+      });
+
+      for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData) {
+          return res.json({ image: `data:image/png;base64,${part.inlineData.data}` });
+        }
+      }
+      res.status(500).json({ error: 'No image generated' });
+    } catch (error: any) {
+      log.error({ err: error }, 'Edit packshot error');
+      res.status(500).json({ error: error.message || 'Edit failed' });
+    }
+  });
+
   // API Catch-all
   app.all("/api/*", (req, res) => {
-    console.log(`404 API Route: ${req.method} ${req.url}`);
+    log.info(`404 API Route: ${req.method} ${req.url}`);
     res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
   });
 
   // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    console.error("GLOBAL SERVER ERROR:", err);
+    log.error({ err }, 'Unhandled server error');
     res.status(500).json({ 
       error: "Internal server error", 
       message: err.message,
@@ -402,15 +592,15 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    log.info(`Server running on http://localhost:${PORT}`);
   });
   } catch (e) {
-    console.error("SERVER STARTUP ERROR:", e);
+    log.error({ err: e }, 'Server startup error');
     process.exit(1);
   }
 }
 
 startServer().catch(err => {
-  console.error("FAILED TO START SERVER:", err);
+  log.error({ err }, 'Failed to start server');
   process.exit(1);
 });

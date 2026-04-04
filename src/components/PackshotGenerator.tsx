@@ -6,7 +6,33 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Sparkles, Loader2, Download, RefreshCw, Layers, Camera, Image as ImageIcon, Sun, Palette, Zap, Target, SlidersHorizontal, Wand2, MessageSquare, Send, Crop, Check, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { generatePackshot, homogenizePackshot, editPackshot } from '../lib/gemini';
+// Gemini AI functions — proxied through server to keep API key server-side only
+const generatePackshot = async (images: { base64: string; mimeType: string }[]): Promise<string> => {
+  const res = await fetch('/api/generate-packshot', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ images }),
+  });
+  if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Generation failed'); }
+  return (await res.json()).image;
+};
+
+const homogenizePackshot = async (currentImage: string, sourceImages: { base64: string; mimeType: string }[], burnt: number, dark: number): Promise<string> => {
+  const res = await fetch('/api/homogenize', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ currentImage, sourceImages, burnt, dark }),
+  });
+  if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Homogenization failed'); }
+  return (await res.json()).image;
+};
+
+const editPackshot = async (currentImage: string, sourceImages: { base64: string; mimeType: string }[], prompt: string): Promise<string> => {
+  const res = await fetch('/api/edit-packshot', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ currentImage, sourceImages, prompt }),
+  });
+  if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Edit failed'); }
+  return (await res.json()).image;
+};
 
 interface ProcessedImage {
   name: string;
@@ -731,9 +757,10 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                 <p className="text-[10px] text-gray-500 font-mono uppercase tracking-widest">{images.length} Processed RAW Frames</p>
               </div>
             </div>
-            <button 
+            <button
               onClick={onReset}
               className="p-2 hover:bg-white/5 rounded-lg text-gray-500 hover:text-white transition-all"
+              aria-label="Reset and upload new files"
             >
               <RefreshCw className="w-5 h-5" />
             </button>
@@ -939,6 +966,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                       onClick={() => setShowExportMenu(!showExportMenu)}
                       disabled={isDownloading || isCropping}
                       className="px-2 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-r-xl border-l border-orange-700 transition-all disabled:opacity-50"
+                      aria-label="Choose export format"
                     >
                       <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M19 9l-7 7-7-7" /></svg>
                     </button>
@@ -1020,6 +1048,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                     <canvas
                       ref={canvasRef}
                       className="w-full h-full object-contain rounded-xl shadow-2xl"
+                      aria-label="Generated packshot result"
                     />
                     {isCropping && (
                       <canvas
@@ -1059,11 +1088,13 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                     onKeyDown={(e) => e.key === 'Enter' && handleEdit()}
                     placeholder="Describe a specific change (e.g., 'Change cap color to red', 'Remove the label')..."
                     className="flex-1 bg-transparent border-none focus:ring-0 text-sm text-white placeholder:text-gray-600 py-2"
+                    aria-label="Edit prompt for targeted AI modification"
                   />
-                  <button 
+                  <button
                     onClick={handleEdit}
                     disabled={!editPrompt.trim() || isEditing}
                     className="p-2 bg-orange-500 hover:bg-orange-600 disabled:bg-gray-800 disabled:text-gray-600 text-white rounded-xl transition-all ml-2"
+                    aria-label="Send edit request"
                   >
                     <Send className="w-4 h-4" />
                   </button>

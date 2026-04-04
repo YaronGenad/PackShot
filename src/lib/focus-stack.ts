@@ -147,10 +147,18 @@ export async function performFocusStack(
   // ── Stage 1: Decode all images ──────────────────────────────────────────
   t = Date.now();
   const decoded: { mat: any; gray: any; width: number; height: number }[] = [];
+  // Track all OpenCV objects for cleanup on error
+  const allMats: any[] = [];
 
   for (const img of images) {
     const { mat, width, height } = await decodeImageToMat(img.base64);
+    allMats.push(mat);
+    if (width > 8192 || height > 8192) {
+      mat.delete();
+      throw new Error(`Image too large (${width}x${height}). Max 8192px per dimension.`);
+    }
     const gray = new cv.Mat();
+    allMats.push(gray);
     cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
     decoded.push({ mat, gray, width, height });
   }
@@ -509,7 +517,10 @@ export async function performFocusStack(
   resultMat.delete();
 
   const totalTimeMs = Date.now() - totalStart;
-  console.log(`[focus-stack] Complete in ${totalTimeMs}ms`);
+  // Safety net: delete any tracked Mats that weren't already cleaned up
+  for (const m of allMats) {
+    try { if (!m.isDeleted?.()) m.delete(); } catch (_) {}
+  }
 
   return {
     result: {
