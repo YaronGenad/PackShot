@@ -1,3 +1,8 @@
+/**
+ * Express backend — handles RAW/PSD upload/extraction, focus stacking, and multi-format export.
+ * API routes: /api/process-raw, /api/focus-stack, /api/export.
+ */
+
 import express from "express";
 import multer from "multer";
 import path from "path";
@@ -5,8 +10,44 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import cors from "cors";
 import sharp from "sharp";
-import exifParser from "exif-parser";
+// @ts-ignore — librawspeed types declare module as "libraw"
+import LibRaw from "librawspeed";
+import { readPsd, writePsdBuffer, initializeCanvas } from "ag-psd";
 import { performFocusStack } from "./src/lib/focus-stack.js";
+
+/** Initialize ag-psd for Node.js — canvas factory that stores pixel data in memory. */
+initializeCanvas(
+  (w: number, h: number) => {
+    const pixelData = new Uint8ClampedArray(w * h * 4);
+    return {
+      width: w, height: h,
+      getContext: () => ({
+        canvas: { width: w, height: h },
+        createImageData: (w2: number, h2: number) => ({ width: w2, height: h2, data: new Uint8ClampedArray(w2 * h2 * 4) }),
+        putImageData: (imgData: any, dx: number, dy: number) => {
+          // Copy pixel data into our backing store
+          const src = imgData.data;
+          const srcW = imgData.width;
+          for (let y = 0; y < imgData.height; y++) {
+            const srcOff = y * srcW * 4;
+            const dstOff = ((y + dy) * w + dx) * 4;
+            pixelData.set(src.subarray(srcOff, srcOff + srcW * 4), dstOff);
+          }
+        },
+        getImageData: (_x: number, _y: number, w2: number, h2: number) => ({ width: w2, height: h2, data: pixelData }),
+      }),
+    } as any;
+  },
+  ((w: number, h: number) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4), colorSpace: 'srgb' as const })) as any
+);
+
+/** All RAW extensions supported by librawspeed (1181+ cameras). */
+const RAW_EXTENSIONS = new Set([
+  '.cr2', '.cr3', '.nef', '.nrw', '.arw', '.srf', '.sr2',
+  '.dng', '.raf', '.orf', '.rw2', '.rwl', '.pef', '.ptx',
+  '.srw', '.x3f', '.3fr', '.fff', '.iiq', '.mrw', '.mef',
+  '.mos', '.kdc', '.dcr', '.raw', '.rwz', '.erf', '.bay',
+]);
 
 // Disable sharp cache to save memory in constrained environments
 sharp.cache(false);
@@ -65,13 +106,13 @@ async function startServer() {
     }
   });
 
-  // API Route to process CR2
+  // Extract preview from any RAW format via librawspeed, fallback to Sharp for non-RAW
   app.post("/api/process-raw", (req, res, next) => {
     console.log("Processing /api/process-raw request...");
     upload.single("images")(req, res, (err) => {
       if (err) {
         console.error("Multer error:", err);
-        return res.status(400).json({ 
+        return res.status(400).json({
           error: `Upload error: ${err.message}`,
           code: err.code
         });
@@ -86,191 +127,122 @@ async function startServer() {
         return res.status(400).json({ error: "No file uploaded" });
       }
 
-      const processedImages = [];
+      const processedImages: any[] = [];
       const filePath = file.path;
-      console.log(`Processing file: ${file.originalname}, size: ${file.size} bytes`);
-      
+      const ext = path.extname(file.originalname).toLowerCase();
+      const isRAW = RAW_EXTENSIONS.has(ext);
+      const isPSD = ext === '.psd' || ext === '.psb';
+      console.log(`Processing file: ${file.originalname}, size: ${file.size} bytes, RAW: ${isRAW}, PSD: ${isPSD}`);
+
       try {
         const buffer = fs.readFileSync(filePath);
         let previewBuffer: Buffer | null = null;
-        // Robust extension check
-        const ext = path.extname(file.originalname).toLowerCase();
-        const isCR2 = ext === '.cr2';
-        
-        console.log(`[PROCESS] File: ${file.originalname}, Size: ${buffer.length} bytes, isCR2: ${isCR2}`);
 
-        // Strategy 1: Use exif-parser (Best for CR2)
-        if (isCR2) {
+        // PSD: read composite or flatten layers into JPEG via ag-psd + Sharp
+        if (isPSD) {
           try {
-            const parser = exifParser.create(buffer);
-            const result = parser.parse();
-            previewBuffer = result.getThumbnailBuffer();
-            if (previewBuffer && previewBuffer.length > 10000) {
-              console.log(`[STRATEGY 1] Exif-parser success for ${file.originalname}, size: ${previewBuffer.length}`);
+            const psd = readPsd(buffer, { useImageData: true, skipLayerImageData: true });
+            if (psd.imageData) {
+              // Composite image — convert RGBA pixels to JPEG via Sharp
+              previewBuffer = await sharp(Buffer.from(psd.imageData.data.buffer), {
+                raw: { width: psd.imageData.width, height: psd.imageData.height, channels: 4 },
+              }).jpeg({ quality: 90 }).toBuffer();
+              console.log(`[PSD COMPOSITE] Success for ${file.originalname}, size: ${previewBuffer.length}`);
             } else {
-              console.log(`[STRATEGY 1] Exif-parser returned no or too small thumbnail for ${file.originalname}`);
-              previewBuffer = null; // Reset if too small
+              // No composite — try first layer with pixel data
+              const psd2 = readPsd(buffer, { useImageData: true, skipCompositeImageData: true });
+              const layer = psd2.children?.find((c: any) => c.imageData);
+              if (layer?.imageData) {
+                previewBuffer = await sharp(Buffer.from(layer.imageData.data.buffer), {
+                  raw: { width: layer.imageData.width, height: layer.imageData.height, channels: 4 },
+                }).jpeg({ quality: 90 }).toBuffer();
+                console.log(`[PSD LAYER] Success from layer "${layer.name}" for ${file.originalname}`);
+              }
             }
-          } catch (e) {
-            console.log(`[STRATEGY 1] Exif-parser failed for ${file.originalname}: ${e instanceof Error ? e.message : String(e)}`);
-          }
-        }
-
-        // Strategy 2: Try sharp directly (ONLY if not CR2, as CR2 direct processing is known to fail with tiff2vips error)
-        if (!previewBuffer && !isCR2) {
-          try {
-            previewBuffer = await sharp(buffer).toBuffer();
-            console.log(`[STRATEGY 2] Sharp direct success for ${file.originalname}`);
           } catch (e: any) {
-            console.log(`[STRATEGY 2] Sharp direct failed for ${file.originalname}: ${e.message}`);
+            console.log(`[PSD] Failed for ${file.originalname}: ${e.message}`);
           }
         }
 
-        // Strategy 3: Manual JPEG extraction (Fallback for CR2 or others)
-        if (!previewBuffer) {
-          console.log(`[STRATEGY 3] Attempting manual JPEG extraction for ${file.originalname}...`);
-          let bestPreview: Buffer | null = null;
-          let searchIdx = 0;
-          const maxSearches = 1000; // Increased search limit
-          let searches = 0;
-
-          // Search for JPEG markers FF D8 ... FF D9
-          while (searches < maxSearches) {
-            const startIdx = buffer.indexOf(Buffer.from([0xff, 0xd8]), searchIdx);
-            if (startIdx === -1) break;
-            
-            // Look for the end of the JPEG
-            // We search for FF D9, but we need to be careful about false positives
-            // A real JPEG usually has a SOI (FF D8) followed by an APP marker (FF E0-EF) or COM (FF FE) or DQT (FF DB)
-            const nextByte = buffer[startIdx + 2];
-            if (nextByte !== 0xff) {
-              searchIdx = startIdx + 2;
-              continue;
-            }
-
-            const endIdx = buffer.indexOf(Buffer.from([0xff, 0xd9]), startIdx + 2);
-            if (endIdx === -1) {
-              searchIdx = startIdx + 2;
-              continue;
-            }
-            
-            const currentPreview = buffer.slice(startIdx, endIdx + 2);
-            
-            // Validate it's a real JPEG by checking for SOF marker (Start of Frame)
-            let isValidJPEG = false;
-            let is8Bit = false;
-            // Search for SOF markers (0xC0 to 0xCF, except 0xC4, 0xC8, 0xCC)
-            const headerSearchLimit = Math.min(currentPreview.length - 10, 65536); // Search deeper
-            for (let i = 0; i < headerSearchLimit; i++) {
-              if (currentPreview[i] === 0xff) {
-                const marker = currentPreview[i+1];
-                if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
-                  isValidJPEG = true;
-                  // The byte at offset 4 (relative to 0xFF) is the data precision.
-                  if (currentPreview[i+4] === 8) {
-                    is8Bit = true;
-                    break;
-                  }
-                }
-              }
-            }
-
-            if (isValidJPEG && is8Bit) {
-              // We want the largest JPEG found (usually the full-size preview)
-              // But we also want to avoid tiny thumbnails
-              if (currentPreview.length > 50000) { // At least 50KB for a decent preview
-                if (!bestPreview || currentPreview.length > bestPreview.length) {
-                  bestPreview = currentPreview;
-                }
-              }
-            }
-            
-            searchIdx = endIdx + 2;
-            searches++;
-          }
-          
-          if (bestPreview) {
-            previewBuffer = bestPreview;
-            console.log(`[STRATEGY 3] Success: Extracted ${bestPreview.length} bytes preview from ${file.originalname}`);
-          } else {
-            console.log(`[STRATEGY 3] Failed: No valid 8-bit JPEG preview found in ${file.originalname}`);
-          }
-        }
-
-        if (previewBuffer) {
-          console.log(`Optimizing preview for ${file.originalname}, preview size: ${previewBuffer.length}`);
-          
-          // Use sharp to optimize and resize
-          // We wrap this in a try-catch because even extracted JPEGs can sometimes be malformed
+        // RAW: extract via librawspeed (thumbnail first, then full decode)
+        if (!previewBuffer && isRAW) {
+          // Strategy 1: LibRaw embedded thumbnail extraction (fast, preserves camera JPEG)
+          const lr = new LibRaw();
           try {
-            const optimized = await sharp(previewBuffer)
-              .rotate() // Auto-rotate based on EXIF
-              .resize(2048, 2048, { fit: 'inside', withoutEnlargement: true })
-              .jpeg({ quality: 80, mozjpeg: true })
-              .toBuffer();
+            await lr.loadBuffer(buffer);
+            const thumbResult = await lr.createThumbnailJPEGBuffer();
+            if (thumbResult?.success && thumbResult.buffer?.length > 10000) {
+              previewBuffer = thumbResult.buffer;
+              console.log(`[LIBRAW THUMB] Success for ${file.originalname}, size: ${previewBuffer.length}`);
+            }
+          } catch (e: any) {
+            console.log(`[LIBRAW THUMB] Failed for ${file.originalname}: ${e.message}`);
+          }
 
-            console.log(`Optimization complete for ${file.originalname}, optimized size: ${optimized.length}`);
-
-            processedImages.push({
-              name: file.originalname,
-              base64: optimized.toString("base64"),
-              mimeType: "image/jpeg"
-            });
-          } catch (sharpErr: any) {
-            console.error(`Sharp optimization failed for ${file.originalname}:`, sharpErr);
-            // Fallback: send the raw preview ONLY if it's not a precision error (which Gemini can't handle anyway)
-            const isPrecisionError = sharpErr.message.includes('precision 14') || sharpErr.message.includes('precision 12');
-            if (isPrecisionError) {
-              processedImages.push({
-                name: file.originalname,
-                error: `Extracted preview is not a standard 8-bit JPEG (${sharpErr.message}).`
-              });
-            } else {
-              processedImages.push({
-                name: file.originalname,
-                base64: previewBuffer.toString("base64"),
-                mimeType: "image/jpeg"
-              });
+          // Strategy 2: LibRaw full RAW decode to JPEG (slower but works if no embedded thumb)
+          if (!previewBuffer) {
+            try {
+              await lr.processImage();
+              const jpegResult = await lr.createJPEGBuffer({ quality: 90 });
+              if (jpegResult?.success && jpegResult.buffer?.length > 10000) {
+                previewBuffer = jpegResult.buffer;
+                console.log(`[LIBRAW DECODE] Success for ${file.originalname}, size: ${previewBuffer.length}`);
+              }
+            } catch (e: any) {
+              console.log(`[LIBRAW DECODE] Failed for ${file.originalname}: ${e.message}`);
             }
           }
-        } else {
-          throw new Error("Could not extract preview from RAW file after trying all strategies. The file might be corrupted or an unsupported RAW format.");
+          lr.close();
         }
+
+        // Strategy 3: Sharp direct decode (for non-RAW or as last resort)
+        if (!previewBuffer) {
+          try {
+            previewBuffer = await sharp(buffer).jpeg({ quality: 90 }).toBuffer();
+            console.log(`[SHARP] Direct decode success for ${file.originalname}, size: ${previewBuffer.length}`);
+          } catch (e: any) {
+            console.log(`[SHARP] Direct decode failed for ${file.originalname}: ${e.message}`);
+          }
+        }
+
+        if (!previewBuffer) {
+          throw new Error("Could not extract preview. File may be corrupted or unsupported.");
+        }
+
+        // Optimize: auto-rotate, resize, compress
+        const optimized = await sharp(previewBuffer)
+          .rotate()
+          .resize(2048, 2048, { fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 80, mozjpeg: true })
+          .toBuffer();
+
+        console.log(`Optimized ${file.originalname}: ${previewBuffer.length} → ${optimized.length} bytes`);
+
+        processedImages.push({
+          name: file.originalname,
+          base64: optimized.toString("base64"),
+          mimeType: "image/jpeg"
+        });
       } catch (err: any) {
         console.error(`Error processing ${file.originalname}:`, err);
         processedImages.push({
           name: file.originalname,
-          error: err.message || "Failed to process RAW file"
+          error: err.message || "Failed to process file"
         });
       } finally {
-        // Clean up the uploaded file to save disk space
         if (fs.existsSync(filePath)) {
-          try {
-            fs.unlinkSync(filePath);
-          } catch (e) {
-            console.error(`Failed to delete temporary file ${filePath}:`, e);
-          }
+          try { fs.unlinkSync(filePath); } catch (_) {}
         }
       }
 
       const success = processedImages.length > 0 && !processedImages[0].error;
-      console.log(`Sending response for ${file.originalname}. Success: ${success}`);
-      
       if (!success) {
-        return res.status(422).json({ 
-          error: processedImages[0]?.error || "Failed to process RAW file", 
-          images: processedImages 
+        return res.status(422).json({
+          error: processedImages[0]?.error || "Failed to process file",
+          images: processedImages
         });
       }
-      
-      try {
-        res.json({ images: processedImages });
-      } catch (jsonErr: any) {
-        console.error(`JSON serialization error for ${file.originalname}:`, jsonErr);
-        if (!res.headersSent) {
-          res.status(500).json({ error: "Failed to serialize image data", details: jsonErr.message });
-        }
-      }
+      res.json({ images: processedImages });
     } catch (error: any) {
       console.error("Processing error:", error);
       if (!res.headersSent) {
@@ -279,37 +251,90 @@ async function startServer() {
     }
   });
 
-  // API Route to convert image to TIFF
-  app.post("/api/convert-to-tiff", async (req, res) => {
+  // Export final image in multiple formats — TIFF, JPEG, PNG, WebP, AVIF, HEIC
+  app.post("/api/export", async (req, res) => {
     try {
-      const { imageBase64 } = req.body;
+      const { imageBase64, format = 'tiff' } = req.body;
       if (!imageBase64) {
         return res.status(400).json({ error: "No image data provided" });
       }
 
-      // Remove data URL prefix if present
       const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, "");
       const buffer = Buffer.from(base64Data, 'base64');
+      const timestamp = Date.now();
 
-      const tiffBuffer = await sharp(buffer)
-        .tiff({
-          compression: 'lzw',
-          predictor: 'horizontal',
-          xres: 300,
-          yres: 300
-        })
-        .toBuffer();
+      let outputBuffer: Buffer;
+      let contentType: string;
+      let extension: string;
 
-      res.setHeader('Content-Type', 'image/tiff');
-      res.setHeader('Content-Disposition', `attachment; filename=packshot-${Date.now()}.tiff`);
-      res.send(tiffBuffer);
+      switch (format) {
+        case 'jpeg':
+          outputBuffer = await sharp(buffer).jpeg({ quality: 95, mozjpeg: true }).toBuffer();
+          contentType = 'image/jpeg';
+          extension = 'jpg';
+          break;
+        case 'png':
+          outputBuffer = await sharp(buffer).png({ compressionLevel: 9 }).toBuffer();
+          contentType = 'image/png';
+          extension = 'png';
+          break;
+        case 'webp':
+          outputBuffer = await sharp(buffer).webp({ quality: 95, lossless: false }).toBuffer();
+          contentType = 'image/webp';
+          extension = 'webp';
+          break;
+        case 'avif':
+          outputBuffer = await sharp(buffer).avif({ quality: 80 }).toBuffer();
+          contentType = 'image/avif';
+          extension = 'avif';
+          break;
+        case 'psd': {
+          // Decode PNG to raw RGBA pixels, then write as PSD with one layer
+          const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+          const pixels = new Uint8ClampedArray(data.buffer, data.byteOffset, data.byteLength);
+          const psd = {
+            width: info.width,
+            height: info.height,
+            channels: 4 as 4,
+            colorMode: 3, // RGB
+            children: [{
+              name: 'Packshot',
+              top: 0, left: 0, bottom: info.height, right: info.width,
+              imageData: { width: info.width, height: info.height, data: pixels },
+            }],
+            imageData: { width: info.width, height: info.height, data: pixels },
+          };
+          outputBuffer = writePsdBuffer(psd) as Buffer;
+          contentType = 'application/x-photoshop';
+          extension = 'psd';
+          break;
+        }
+        case 'tiff':
+        default:
+          outputBuffer = await sharp(buffer)
+            .tiff({ compression: 'lzw', predictor: 'horizontal', xres: 300, yres: 300 })
+            .toBuffer();
+          contentType = 'image/tiff';
+          extension = 'tiff';
+          break;
+      }
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `attachment; filename=packshot-${timestamp}.${extension}`);
+      res.send(outputBuffer);
     } catch (error: any) {
-      console.error("TIFF conversion error:", error);
-      res.status(500).json({ error: "Failed to convert image to TIFF", details: error.message });
+      console.error(`Export error (${req.body?.format}):`, error);
+      res.status(500).json({ error: `Failed to export as ${req.body?.format || 'tiff'}`, details: error.message });
     }
   });
 
-  // API Route for focus stacking with alignment
+  // Legacy endpoint — redirect to new /api/export
+  app.post("/api/convert-to-tiff", async (req, res) => {
+    req.body.format = 'tiff';
+    res.redirect(307, '/api/export');
+  });
+
+  // Deterministic focus stacking — OpenCV alignment + multi-scale compositing, no LLM
   app.post("/api/focus-stack", async (req, res) => {
     const startTime = Date.now();
     try {

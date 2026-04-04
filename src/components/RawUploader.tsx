@@ -1,3 +1,8 @@
+/**
+ * RAW file upload component — drag-drop or file picker, sends each file
+ * to /api/process-raw with retry logic and exponential backoff.
+ */
+
 import React, { useState, useRef } from 'react';
 import { Upload, FileCode, X, CheckCircle2, Loader2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -20,7 +25,8 @@ export const RawUploader: React.FC<RawUploaderProps> = ({ onImagesProcessed }) =
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
-      const newFiles = (Array.from(e.target.files) as File[]).filter(f => f.name.toLowerCase().endsWith('.cr2'));
+      const rawExtensions = ['.cr2','.cr3','.nef','.nrw','.arw','.srf','.sr2','.dng','.raf','.orf','.rw2','.rwl','.pef','.ptx','.srw','.x3f','.3fr','.fff','.iiq','.mrw','.mef','.mos','.kdc','.dcr','.raw','.rwz','.erf','.bay','.psd','.psb'];
+      const newFiles = (Array.from(e.target.files) as File[]).filter(f => rawExtensions.some(ext => f.name.toLowerCase().endsWith(ext)));
       setFiles(prev => [...prev, ...newFiles]);
     }
   };
@@ -131,7 +137,8 @@ export const RawUploader: React.FC<RawUploaderProps> = ({ onImagesProcessed }) =
         onDragOver={(e) => e.preventDefault()}
         onDrop={(e) => {
           e.preventDefault();
-          const droppedFiles = (Array.from(e.dataTransfer.files) as File[]).filter(f => f.name.toLowerCase().endsWith('.cr2'));
+          const rawExtensions = ['.cr2','.cr3','.nef','.nrw','.arw','.srf','.sr2','.dng','.raf','.orf','.rw2','.rwl','.pef','.ptx','.srw','.x3f','.3fr','.fff','.iiq','.mrw','.mef','.mos','.kdc','.dcr','.raw','.rwz','.erf','.bay','.psd','.psb'];
+          const droppedFiles = (Array.from(e.dataTransfer.files) as File[]).filter(f => rawExtensions.some(ext => f.name.toLowerCase().endsWith(ext)));
           setFiles(prev => [...prev, ...droppedFiles]);
         }}
         className="group relative border-2 border-dashed border-white/10 hover:border-orange-500/50 rounded-2xl p-12 transition-all cursor-pointer bg-white/[0.02] hover:bg-white/[0.04] overflow-hidden"
@@ -143,15 +150,15 @@ export const RawUploader: React.FC<RawUploaderProps> = ({ onImagesProcessed }) =
             <Upload className="w-8 h-8 text-gray-400 group-hover:text-orange-500" />
           </div>
           <div className="space-y-1">
-            <h3 className="text-lg font-medium text-white">Upload CR2 RAW Files</h3>
-            <p className="text-sm text-gray-500">Drag and drop or click to select Canon RAW files</p>
+            <h3 className="text-lg font-medium text-white">Upload RAW Files</h3>
+            <p className="text-sm text-gray-500">Drag and drop or click to select camera RAW or PSD files</p>
           </div>
           <input 
             type="file" 
             ref={fileInputRef} 
             onChange={handleFileChange} 
             multiple 
-            accept=".cr2" 
+            accept=".cr2,.cr3,.nef,.nrw,.arw,.srf,.sr2,.dng,.raf,.orf,.rw2,.rwl,.pef,.ptx,.srw,.x3f,.3fr,.fff,.iiq,.mrw,.mef,.mos,.kdc,.dcr,.raw,.rwz,.erf,.bay,.psd,.psb" 
             className="hidden" 
           />
         </div>
