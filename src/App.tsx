@@ -111,7 +111,7 @@ export default function App() {
             transition={{ delay: 0.2 }}
             className="text-gray-500 text-lg max-w-2xl mx-auto leading-relaxed"
           >
-            Upload your Canon CR2 RAW files and let our AI synthesis engine create professional, 
+            Upload your camera RAW files and create professional,
             high-fidelity product packshots with perfect studio lighting.
           </motion.p>
         </section>
@@ -150,7 +150,7 @@ export default function App() {
             {
               icon: <Layers className="w-6 h-6" />,
               title: "RAW Processing",
-              desc: "Deep analysis of CR2 data to extract high-fidelity previews for AI synthesis."
+              desc: "Deep analysis of RAW data to extract high-fidelity previews. Supports 1181+ cameras."
             },
             {
               icon: <Sparkles className="w-6 h-6" />,

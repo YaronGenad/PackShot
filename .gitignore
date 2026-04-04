@@ -12,5 +12,8 @@ exemplsForTests/
 test-result-*.jpg
 test-*.mjs
 
+# Benchmark output (script is tracked, results are not)
+benchmark-results.json
+
 # Uploads
 uploads/
