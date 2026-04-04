@@ -1,5 +1,10 @@
+/**
+ * Main generation UI — three methods (AI/Aligned/Quick), post-processing
+ * adjustments (gamma, RGB, vibrance, sharpen), interactive crop, and TIFF export.
+ */
+
 import React, { useState, useEffect, useRef } from 'react';
-import { Sparkles, Loader2, Download, RefreshCw, Layers, Camera, Image as ImageIcon, Sun, Palette, Zap, Target, SlidersHorizontal, Wand2, MessageSquare, Send } from 'lucide-react';
+import { Sparkles, Loader2, Download, RefreshCw, Layers, Camera, Image as ImageIcon, Sun, Palette, Zap, Target, SlidersHorizontal, Wand2, MessageSquare, Send, Crop, Check, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { generatePackshot, homogenizePackshot, editPackshot } from '../lib/gemini';
 
@@ -24,6 +29,13 @@ interface Adjustments {
   sharpen: number;
 }
 
+interface CropRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 const DEFAULT_ADJUSTMENTS: Adjustments = {
   gammaBg: 1,
   gammaObj: 1,
@@ -46,9 +58,16 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
   const [resultImage, setResultImage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [adjustments, setAdjustments] = useState<Adjustments>(DEFAULT_ADJUSTMENTS);
-  
+  const [exportFormat, setExportFormat] = useState<string>('tiff');
+  const [showExportMenu, setShowExportMenu] = useState(false);
+
+  const [isCropping, setIsCropping] = useState(false);
+  const [cropRect, setCropRect] = useState<CropRect | null>(null);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const cropOverlayRef = useRef<HTMLCanvasElement>(null);
   const originalImageRef = useRef<HTMLImageElement | null>(null);
+  const dragStateRef = useRef<{ type: string; startX: number; startY: number; startRect: CropRect } | null>(null);
 
   // Reset state when source images change to prevent caching old results
   useEffect(() => {
@@ -64,6 +83,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
 
   const rafRef = useRef<number | null>(null);
 
+  /** Dispatch to selected generation method: AI, aligned stack, or quick stack. */
   const handleGenerate = async () => {
     if (generationMethod === 'ai') {
       setIsGenerating(true);
@@ -98,6 +118,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     }
   };
 
+  /** Quick stack — client-side Laplacian per-pixel selection, no alignment. */
   const handleMathematicalStacking = async () => {
     setIsGenerating(true);
     setError(null);
@@ -209,6 +230,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     }
   };
 
+  /** Aligned stack — server-side OpenCV alignment + multi-scale focus compositing. */
   const handleAlignedStacking = async () => {
     setIsGenerating(true);
     setError(null);
@@ -254,6 +276,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     }
   };
 
+  /** Send current result + sources to Gemini for lighting balance correction. */
   const handleHomogenize = async () => {
     if (!resultImage) return;
     setIsHomogenizing(true);
@@ -278,6 +301,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     }
   };
 
+  /** Apply user's free-form edit prompt via Gemini (e.g. "change cap to red"). */
   const handleEdit = async () => {
     if (!resultImage || !editPrompt.trim()) return;
     setIsEditing(true);
@@ -302,6 +326,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     }
   };
 
+  /** Redraw canvas with gamma, RGB, vibrance, sharpen — all client-side pixel math. */
   const applyAdjustments = () => {
     const canvas = canvasRef.current;
     const img = originalImageRef.current;
@@ -418,38 +443,270 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     };
   }, [adjustments, resultImage]);
 
-  const downloadResult = async () => {
+  // ── Crop Functions ──────────────────────────────────────────────────────
+
+  /** Compute CSS-to-image coordinate mapping for object-contain canvas scaling. */
+  const getCanvasToImageScale = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { scaleX: 1, scaleY: 1, offsetX: 0, offsetY: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const imgW = canvas.width;
+    const imgH = canvas.height;
+    const displayAspect = rect.width / rect.height;
+    const imgAspect = imgW / imgH;
+    let renderW: number, renderH: number, offsetX: number, offsetY: number;
+    if (imgAspect > displayAspect) {
+      renderW = rect.width;
+      renderH = rect.width / imgAspect;
+      offsetX = 0;
+      offsetY = (rect.height - renderH) / 2;
+    } else {
+      renderH = rect.height;
+      renderW = rect.height * imgAspect;
+      offsetX = (rect.width - renderW) / 2;
+      offsetY = 0;
+    }
+    return { scaleX: imgW / renderW, scaleY: imgH / renderH, offsetX, offsetY, renderW, renderH };
+  };
+
+  const cssToImage = (cssX: number, cssY: number) => {
+    const { scaleX, scaleY, offsetX, offsetY } = getCanvasToImageScale();
+    return {
+      x: (cssX - offsetX) * scaleX,
+      y: (cssY - offsetY) * scaleY,
+    };
+  };
+
+  const imageToCSS = (imgX: number, imgY: number) => {
+    const { scaleX, scaleY, offsetX, offsetY } = getCanvasToImageScale();
+    return {
+      x: imgX / scaleX + offsetX,
+      y: imgY / scaleY + offsetY,
+    };
+  };
+
+  /** Initialize crop with 5% margin inset — user drags handles to adjust. */
+  const startCrop = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    
+    const margin = Math.min(canvas.width, canvas.height) * 0.05;
+    setCropRect({ x: margin, y: margin, w: canvas.width - margin * 2, h: canvas.height - margin * 2 });
+    setIsCropping(true);
+  };
+
+  const cancelCrop = () => {
+    setIsCropping(false);
+    setCropRect(null);
+  };
+
+  /** Extract cropped region, replace originalImageRef, re-apply adjustments. */
+  const applyCrop = () => {
+    const canvas = canvasRef.current;
+    if (!canvas || !cropRect) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const cx = Math.round(Math.max(0, cropRect.x));
+    const cy = Math.round(Math.max(0, cropRect.y));
+    const cw = Math.round(Math.min(cropRect.w, canvas.width - cx));
+    const ch = Math.round(Math.min(cropRect.h, canvas.height - cy));
+
+    const croppedData = ctx.getImageData(cx, cy, cw, ch);
+    const tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width = cw;
+    tmpCanvas.height = ch;
+    const tmpCtx = tmpCanvas.getContext('2d')!;
+    tmpCtx.putImageData(croppedData, 0, 0);
+
+    const dataUrl = tmpCanvas.toDataURL('image/png');
+    const img = new Image();
+    img.src = dataUrl;
+    img.onload = () => {
+      originalImageRef.current = img;
+      setResultImage(dataUrl);
+      setIsCropping(false);
+      setCropRect(null);
+      applyAdjustments();
+    };
+  };
+
+  /** Render dark mask, crop border, rule-of-thirds grid, and drag handles. */
+  const drawCropOverlay = () => {
+    const overlay = cropOverlayRef.current;
+    const canvas = canvasRef.current;
+    if (!overlay || !canvas || !cropRect) return;
+
+    const rect = canvas.getBoundingClientRect();
+    overlay.width = rect.width;
+    overlay.height = rect.height;
+    const ctx = overlay.getContext('2d')!;
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+    const tl = imageToCSS(cropRect.x, cropRect.y);
+    const br = imageToCSS(cropRect.x + cropRect.w, cropRect.y + cropRect.h);
+    const cssW = br.x - tl.x;
+    const cssH = br.y - tl.y;
+
+    // Dark mask outside crop
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+    ctx.fillRect(0, 0, overlay.width, overlay.height);
+    ctx.clearRect(tl.x, tl.y, cssW, cssH);
+
+    // Crop border
+    ctx.strokeStyle = '#f97316';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(tl.x, tl.y, cssW, cssH);
+
+    // Rule of thirds lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i <= 2; i++) {
+      ctx.beginPath();
+      ctx.moveTo(tl.x + cssW * i / 3, tl.y);
+      ctx.lineTo(tl.x + cssW * i / 3, tl.y + cssH);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(tl.x, tl.y + cssH * i / 3);
+      ctx.lineTo(tl.x + cssW, tl.y + cssH * i / 3);
+      ctx.stroke();
+    }
+
+    // Handles
+    const handleSize = 8;
+    ctx.fillStyle = '#f97316';
+    const handles = [
+      { x: tl.x, y: tl.y }, { x: tl.x + cssW / 2, y: tl.y }, { x: tl.x + cssW, y: tl.y },
+      { x: tl.x, y: tl.y + cssH / 2 }, { x: tl.x + cssW, y: tl.y + cssH / 2 },
+      { x: tl.x, y: tl.y + cssH }, { x: tl.x + cssW / 2, y: tl.y + cssH }, { x: tl.x + cssW, y: tl.y + cssH },
+    ];
+    handles.forEach(h => {
+      ctx.fillRect(h.x - handleSize / 2, h.y - handleSize / 2, handleSize, handleSize);
+    });
+
+    // Dimensions label
+    ctx.fillStyle = 'rgba(249, 115, 22, 0.9)';
+    ctx.font = '11px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${Math.round(cropRect.w)} × ${Math.round(cropRect.h)}`, tl.x + cssW / 2, tl.y - 8);
+  };
+
+  useEffect(() => {
+    if (isCropping && cropRect) {
+      drawCropOverlay();
+    }
+  }, [isCropping, cropRect]);
+
+  /** Hit-test which handle (tl/tr/bl/br/t/b/l/r/move) the cursor is near. */
+  const getHandle = (cssX: number, cssY: number): string => {
+    if (!cropRect) return '';
+    const tl = imageToCSS(cropRect.x, cropRect.y);
+    const br = imageToCSS(cropRect.x + cropRect.w, cropRect.y + cropRect.h);
+    const tolerance = 12;
+    const onLeft = Math.abs(cssX - tl.x) < tolerance;
+    const onRight = Math.abs(cssX - br.x) < tolerance;
+    const onTop = Math.abs(cssY - tl.y) < tolerance;
+    const onBottom = Math.abs(cssY - br.y) < tolerance;
+    if (onTop && onLeft) return 'tl';
+    if (onTop && onRight) return 'tr';
+    if (onBottom && onLeft) return 'bl';
+    if (onBottom && onRight) return 'br';
+    if (onTop) return 't';
+    if (onBottom) return 'b';
+    if (onLeft) return 'l';
+    if (onRight) return 'r';
+    if (cssX > tl.x && cssX < br.x && cssY > tl.y && cssY < br.y) return 'move';
+    return '';
+  };
+
+  const handleCropMouseDown = (e: React.MouseEvent) => {
+    if (!cropRect) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+    const handle = getHandle(cssX, cssY);
+    if (!handle) return;
+    dragStateRef.current = { type: handle, startX: cssX, startY: cssY, startRect: { ...cropRect } };
+    e.preventDefault();
+  };
+
+  const handleCropMouseMove = (e: React.MouseEvent) => {
+    const overlay = cropOverlayRef.current;
+    if (!overlay || !cropRect) return;
+    const rect = overlay.getBoundingClientRect();
+    const cssX = e.clientX - rect.left;
+    const cssY = e.clientY - rect.top;
+
+    // Update cursor
+    const handle = dragStateRef.current?.type || getHandle(cssX, cssY);
+    const cursors: Record<string, string> = { tl: 'nw-resize', tr: 'ne-resize', bl: 'sw-resize', br: 'se-resize', t: 'n-resize', b: 's-resize', l: 'w-resize', r: 'e-resize', move: 'move' };
+    overlay.style.cursor = cursors[handle] || 'default';
+
+    if (!dragStateRef.current) return;
+    const { type, startX, startY, startRect } = dragStateRef.current;
+    const img = cssToImage(cssX, cssY);
+    const startImg = cssToImage(startX, startY);
+    const dx = img.x - startImg.x;
+    const dy = img.y - startImg.y;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const maxW = canvas.width;
+    const maxH = canvas.height;
+
+    let { x, y, w, h } = startRect;
+    const minSize = 50;
+
+    if (type === 'move') {
+      x = Math.max(0, Math.min(maxW - w, x + dx));
+      y = Math.max(0, Math.min(maxH - h, y + dy));
+    } else {
+      if (type.includes('l')) { const nx = Math.max(0, x + dx); w = w + (x - nx); x = nx; }
+      if (type.includes('r')) { w = Math.max(minSize, Math.min(maxW - x, w + dx)); }
+      if (type.includes('t')) { const ny = Math.max(0, y + dy); h = h + (y - ny); y = ny; }
+      if (type.includes('b')) { h = Math.max(minSize, Math.min(maxH - y, h + dy)); }
+      if (w < minSize) w = minSize;
+      if (h < minSize) h = minSize;
+    }
+
+    setCropRect({ x, y, w, h });
+  };
+
+  const handleCropMouseUp = () => {
+    dragStateRef.current = null;
+  };
+
+  /** Send canvas content to server for format conversion and trigger browser download. */
+  const downloadResult = async (format: string = exportFormat) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
     setIsDownloading(true);
+    setShowExportMenu(false);
     try {
       const imageBase64 = canvas.toDataURL('image/png');
-      
-      const response = await fetch('/api/convert-to-tiff', {
+
+      const response = await fetch('/api/export', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ imageBase64 }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64, format }),
       });
 
       if (!response.ok) {
-        throw new Error('Failed to convert to TIFF');
+        throw new Error(`Failed to export as ${format.toUpperCase()}`);
       }
 
       const blob = await response.blob();
       const url = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `packshot-${Date.now()}.tiff`;
+      const ext = format === 'jpeg' ? 'jpg' : format;
+      link.download = `packshot-${Date.now()}.${ext}`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
       window.URL.revokeObjectURL(url);
     } catch (err) {
       console.error('Download error:', err);
-      setError('Failed to download TIFF. Please try again.');
+      setError(`Failed to download as ${format.toUpperCase()}. Please try again.`);
     } finally {
       setIsDownloading(false);
     }
@@ -637,18 +894,85 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                   </AnimatePresence>
                 </div>
 
-                <button 
-                  onClick={downloadResult}
-                  disabled={isDownloading}
-                  className="flex items-center space-x-2 px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-xl transition-all font-bold text-xs uppercase tracking-widest disabled:opacity-50"
-                >
-                  {isDownloading ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Download className="w-4 h-4" />
-                  )}
-                  <span>{isDownloading ? 'Converting...' : 'Download TIFF'}</span>
-                </button>
+                {!isCropping ? (
+                  <button
+                    onClick={startCrop}
+                    className="flex items-center space-x-2 px-4 py-2 bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-xl transition-all font-bold text-xs uppercase tracking-widest"
+                  >
+                    <Crop className="w-4 h-4 text-orange-500" />
+                    <span>Crop</span>
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={applyCrop}
+                      className="flex items-center space-x-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-xl transition-all font-bold text-xs uppercase tracking-widest"
+                    >
+                      <Check className="w-4 h-4" />
+                      <span>Apply Crop</span>
+                    </button>
+                    <button
+                      onClick={cancelCrop}
+                      className="flex items-center space-x-2 px-4 py-2 bg-white/5 hover:bg-white/10 text-white border border-white/10 rounded-xl transition-all font-bold text-xs uppercase tracking-widest"
+                    >
+                      <X className="w-4 h-4" />
+                      <span>Cancel</span>
+                    </button>
+                  </>
+                )}
+
+                <div className="relative">
+                  <div className="flex">
+                    <button
+                      onClick={() => downloadResult()}
+                      disabled={isDownloading || isCropping}
+                      className="flex items-center space-x-2 px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-l-xl transition-all font-bold text-xs uppercase tracking-widest disabled:opacity-50"
+                    >
+                      {isDownloading ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Download className="w-4 h-4" />
+                      )}
+                      <span>{isDownloading ? 'Exporting...' : `Download ${exportFormat.toUpperCase()}`}</span>
+                    </button>
+                    <button
+                      onClick={() => setShowExportMenu(!showExportMenu)}
+                      disabled={isDownloading || isCropping}
+                      className="px-2 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-r-xl border-l border-orange-700 transition-all disabled:opacity-50"
+                    >
+                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M19 9l-7 7-7-7" /></svg>
+                    </button>
+                  </div>
+
+                  <AnimatePresence>
+                    {showExportMenu && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 6, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: 6, scale: 0.95 }}
+                        className="absolute top-full right-0 mt-2 w-48 bg-[#1a1b1e] border border-white/10 rounded-xl shadow-2xl z-50 overflow-hidden"
+                      >
+                        {[
+                          { id: 'tiff', label: 'TIFF', desc: 'LZW, 300 DPI' },
+                          { id: 'jpeg', label: 'JPEG', desc: 'Quality 95, MozJPEG' },
+                          { id: 'png', label: 'PNG', desc: 'Lossless' },
+                          { id: 'webp', label: 'WebP', desc: 'Quality 95' },
+                          { id: 'avif', label: 'AVIF', desc: 'Quality 80' },
+                          { id: 'psd', label: 'PSD', desc: 'Photoshop, 1 layer' },
+                        ].map(fmt => (
+                          <button
+                            key={fmt.id}
+                            onClick={() => { setExportFormat(fmt.id); setShowExportMenu(false); }}
+                            className={`w-full flex items-center justify-between px-4 py-2.5 text-left transition-colors ${exportFormat === fmt.id ? 'bg-orange-500/20 text-orange-400' : 'text-gray-300 hover:bg-white/5'}`}
+                          >
+                            <span className="text-xs font-bold uppercase tracking-widest">{fmt.label}</span>
+                            <span className="text-[9px] text-gray-500">{fmt.desc}</span>
+                          </button>
+                        ))}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
               </div>
             )}
           </div>
@@ -693,10 +1017,21 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                     animate={{ opacity: 1, scale: 1 }}
                     className="w-full h-full p-4"
                   >
-                    <canvas 
+                    <canvas
                       ref={canvasRef}
                       className="w-full h-full object-contain rounded-xl shadow-2xl"
                     />
+                    {isCropping && (
+                      <canvas
+                        ref={cropOverlayRef}
+                        className="absolute inset-0 w-full h-full rounded-xl"
+                        style={{ pointerEvents: 'auto' }}
+                        onMouseDown={handleCropMouseDown}
+                        onMouseMove={handleCropMouseMove}
+                        onMouseUp={handleCropMouseUp}
+                        onMouseLeave={handleCropMouseUp}
+                      />
+                    )}
                   </motion.div>
                 ) : (
                   <div className="flex flex-col items-center space-y-4 text-gray-600">
