@@ -1,6 +1,10 @@
 # RAW Packshot Studio Synthesizer
 
-Professional tool for converting Canon CR2 RAW focus brackets into sharp, studio-quality product packshots.
+Professional tool for converting camera RAW focus brackets into sharp, studio-quality product packshots. Supports 1181+ camera models (Canon, Nikon, Sony, Fujifilm, Panasonic, Leica, and more).
+
+## Supported RAW Formats
+
+CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PEF, SRW, X3F, 3FR, IIQ, MRW, MEF, KDC, DCR, ERF, and more — powered by librawspeed (LibRaw).
 
 ## Features
 
@@ -23,6 +27,7 @@ Professional tool for converting Canon CR2 RAW focus brackets into sharp, studio
 ### Post-Processing
 - Gamma control (separate background/object)
 - RGB balance, vibrance, sharpen
+- Interactive crop tool
 - Export to TIFF (LZW compressed, 300 DPI)
 
 ## Run Locally
@@ -45,52 +50,42 @@ On startup you can either enter a Gemini API key (for AI features) or skip to us
 
 ## Usage
 
-1. Upload CR2 files (multiple shots of the same product with different focus points)
+1. Upload RAW files (multiple shots of the same product with different focus points)
 2. Choose a generation method:
    - **AI Synthesis** — Gemini-powered studio packshot (requires API key)
    - **Aligned Stack** — Deterministic OpenCV alignment + multi-scale focus stacking
    - **Quick Stack** — Fast client-side stacking without alignment
 3. Adjust the result (gamma, RGB, vibrance, sharpen)
-4. Download as TIFF
-
-## Test Data
-
-The `exemplsForTests/` directory contains 5 sets of CR2 focus brackets for testing:
-
-| Set | Files | Description |
-|-----|-------|-------------|
-| first | 4 CR2 | Standard 4-shot bracket |
-| second | 3 CR2 | Minimal 3-shot bracket |
-| third | 3 CR2 | 3-shot bracket |
-| forth | 4 CR2 | 4-shot bracket |
-| fifth | 6 CR2 | Extended 6-shot bracket |
+4. Crop edges if needed
+5. Download as TIFF
 
 ## Tech Stack
 
 - **Frontend:** React 19, TypeScript, Tailwind CSS, Vite
 - **Backend:** Express.js, Sharp (image processing)
+- **RAW Decoding:** librawspeed (LibRaw native addon, 1181+ cameras)
 - **Alignment:** @techstark/opencv-js (WASM) — AKAZE, BFMatcher, findHomography, warpPerspective
 - **AI (optional):** Google Gemini 3.1 Flash Image via @google/genai
 
 ## Architecture
 
 ```
-CR2 Upload → /api/process-raw → JPEG extraction (EXIF/manual) → Sharp optimization
-                                                                        ↓
-                                                              Processed base64 images
-                                                                        ↓
-                                              ┌─────────────────────────┼──────────────────────┐
-                                              ↓                         ↓                      ↓
-                                    AI Synthesis              Aligned Stack              Quick Stack
-                                    (Gemini API)          /api/focus-stack             (client-side)
-                                                      OpenCV alignment +
-                                                      multi-scale focus +
-                                                      weighted compositing
-                                              └─────────────────────────┼──────────────────────┘
-                                                                        ↓
-                                                              Canvas adjustments
-                                                         (gamma, RGB, vibrance, sharpen)
-                                                                        ↓
-                                                              /api/convert-to-tiff
-                                                                   Download
+RAW Upload → /api/process-raw → librawspeed extraction → Sharp optimization
+                                                                ↓
+                                                      Processed base64 images
+                                                                ↓
+                                          ┌─────────────────────┼──────────────────────┐
+                                          ↓                     ↓                      ↓
+                                AI Synthesis          Aligned Stack              Quick Stack
+                                (Gemini API)      /api/focus-stack             (client-side)
+                                              OpenCV alignment +
+                                              multi-scale focus +
+                                              weighted compositing
+                                          └─────────────────────┼──────────────────────┘
+                                                                ↓
+                                                      Canvas adjustments
+                                                 (gamma, RGB, vibrance, sharpen, crop)
+                                                                ↓
+                                                      /api/convert-to-tiff
+                                                           Download
 ```

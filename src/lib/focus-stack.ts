@@ -1,3 +1,9 @@
+/**
+ * Focus Stack Engine — deterministic image alignment and multi-scale focus stacking.
+ * Uses OpenCV.js (WASM) for feature detection, homography estimation, and warping.
+ * No LLM or external API calls — pure computer vision math.
+ */
+
 import cv from '@techstark/opencv-js';
 import sharp from 'sharp';
 import type {
@@ -11,6 +17,7 @@ import type {
 
 let cvReady: Promise<void> | null = null;
 
+/** Wait for WASM runtime to initialize; cached after first call. */
 function ensureCV(): Promise<void> {
   if (!cvReady) {
     cvReady = new Promise<void>((resolve) => {
@@ -26,6 +33,7 @@ function ensureCV(): Promise<void> {
 
 // ── Helper: decode base64 image to cv.Mat (RGBA) ────────────────────────────
 
+/** Decode base64 JPEG to OpenCV RGBA Mat via Sharp raw pixel extraction. */
 async function decodeImageToMat(base64: string): Promise<{ mat: any; width: number; height: number }> {
   // Use sharp to decode to raw RGBA pixels
   const buf = Buffer.from(base64, 'base64');
@@ -41,6 +49,7 @@ async function decodeImageToMat(base64: string): Promise<{ mat: any; width: numb
 
 // ── Helper: cv.Mat (RGBA) to JPEG base64 via sharp ──────────────────────────
 
+/** Convert OpenCV RGBA Mat back to JPEG base64 for API response. */
 async function matToBase64(mat: any, width: number, height: number): Promise<string> {
   const rawBuf = Buffer.from(mat.data);
   const jpegBuf = await sharp(rawBuf, {
@@ -54,6 +63,7 @@ async function matToBase64(mat: any, width: number, height: number): Promise<str
 
 // ── Helper: compute global Laplacian variance (sharpness score) ─────────────
 
+/** Laplacian variance — higher value means more edges, i.e. more in-focus content. */
 function computeGlobalSharpness(gray: any): number {
   const lap = new cv.Mat();
   cv.Laplacian(gray, lap, cv.CV_32F, 3);
@@ -71,6 +81,7 @@ function computeGlobalSharpness(gray: any): number {
 
 // ── Helper: compute multi-scale focus map ───────────────────────────────────
 
+/** Multi-scale Laplacian focus map — 3 kernel sizes weighted 50/30/20, Gaussian smoothed. */
 function computeFocusMap(gray: any, blurSigma: number): any {
   const lapFine = new cv.Mat();
   const lapMedium = new cv.Mat();
@@ -109,6 +120,11 @@ function computeFocusMap(gray: any, blurSigma: number): any {
 
 // ── Main: performFocusStack ─────────────────────────────────────────────────
 
+/**
+ * Main entry point — aligns images via AKAZE+Homography, computes multi-scale
+ * focus maps, and composites using weighted soft blending. Returns JPEG result
+ * with full diagnostics (match counts, reproj errors, timing per stage).
+ */
 export async function performFocusStack(
   images: FocusStackImage[],
   options?: FocusStackOptions

@@ -1,5 +1,11 @@
+/**
+ * Gemini API client — three functions for AI-powered packshot generation.
+ * Non-deterministic: results vary between runs. Requires paid API key.
+ */
+
 import { GoogleGenAI } from "@google/genai";
 
+/** Generate studio packshot from source images — pure white bg, zero creativity. */
 export async function generatePackshot(images: { base64: string, mimeType: string }[]) {
   // Create a new GoogleGenAI instance right before making an API call
   // to ensure it always uses the most up-to-date API key from the dialog.
@@ -67,6 +73,7 @@ export async function generatePackshot(images: { base64: string, mimeType: strin
   }
 }
 
+/** Balance lighting — reduce burnt highlights, lift dark shadows using source context. */
 export async function homogenizePackshot(
   currentResultBase64: string, 
   sourceImages: { base64: string, mimeType: string }[],
@@ -146,6 +153,7 @@ export async function homogenizePackshot(
   }
 }
 
+/** Apply targeted edit from user prompt — change color, remove label, etc. */
 export async function editPackshot(currentResultBase64: string, sourceImages: { base64: string, mimeType: string }[], editPrompt: string) {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
