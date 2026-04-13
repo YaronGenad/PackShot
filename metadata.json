@@ -1,5 +1,4 @@
 {
-  "name": "RAW Packshot Creator",
-  "description": "Professional tool for converting CR2 RAW images into clean, studio-quality product packshots using Gemini AI.",
-  "requestFramePermissions": []
+  "name": "PackShot Studio",
+  "description": "Professional focus stacking and product photography tool. Converts camera RAW files into studio-quality packshots."
 }

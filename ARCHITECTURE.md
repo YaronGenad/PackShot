@@ -2,28 +2,27 @@
 
 ## System Overview
 
-RAW PackShot Studio converts camera RAW focus brackets (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, and 20+ more formats) into sharp product packshots using three independent pipelines: client-side quick stacking, server-side OpenCV-aligned stacking, and optional AI synthesis via Gemini.
+PackShot Studio converts camera RAW focus brackets (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PSD, and 20+ more formats) into sharp product packshots. Three processing methods: deterministic focus stacking (Quick/Aligned), and optional multi-provider AI synthesis (Gemini/OpenAI/Grok).
 
 ## Pipeline
 
 ```
-RAW File Upload (multipart, max 100MB)
+RAW/PSD File Upload (multipart, max 100MB)
     │
     ▼
 ┌──────────────────────────────────────────┐
 │  POST /api/process-raw                    │
 │                                           │
 │  Strategy 1: librawspeed thumbnail        │
-│    └─ loadBuffer() → createThumbnail-     │
-│       JPEGBuffer() (fast, embedded JPEG)  │
+│    └─ loadBuffer() → embedded JPEG (fast) │
 │  Strategy 2: librawspeed full decode      │
-│    └─ processImage() → createJPEGBuffer() │
-│       (full RAW demosaic, slower)         │
-│  Strategy 3: Sharp direct (fallback)      │
-│    └─ For non-RAW or unsupported files    │
+│    └─ processImage() → JPEG (full RAW)    │
+│  Strategy 3: ag-psd (PSD files)           │
+│    └─ readPsd() → composite/layer RGBA    │
+│  Strategy 4: Sharp direct (fallback)      │
 │                                           │
-│  Sharp Optimization:                      │
-│    rotate() → resize(2048) → jpeg(q=80)   │
+│  + Magic byte validation (anti-spoofing)  │
+│  + Sharp optimization (rotate, 2048px)    │
 └──────────────────────────────────────────┘
     │
     ▼
@@ -32,52 +31,35 @@ RAW File Upload (multipart, max 100MB)
     ▼
 ┌────────────────┬─────────────────────┬──────────────────┐
 │  Quick Stack   │  Aligned Stack      │  AI Synthesis    │
-│  (client-side) │  (server-side)      │  (Gemini API)    │
+│  (client-side) │  (server-side)      │  (server proxy)  │
 │                │                     │                  │
-│  Laplacian     │  POST /api/         │  generatePackshot│
-│  variance per  │  focus-stack        │  ()              │
-│  pixel         │                     │                  │
-│                │  1. Reference       │  Gemini 3.1      │
-│  Box blur      │     selection       │  Flash Image     │
-│  (radius 3)    │     (max Laplacian  │                  │
-│                │      variance)      │  System prompt:  │
-│  argmax pixel  │                     │  pure white bg,  │
-│  selection     │  2. AKAZE features  │  zero creativity,│
-│                │     + BFMatcher     │  exact fidelity  │
-│  No alignment  │     + Lowe's ratio  │                  │
-│  → ghosting    │                     │  Non-deterministic│
-│  possible      │  3. findHomography  │  → varies between│
-│                │     (RANSAC, t=3.0) │    runs          │
-│                │                     │                  │
-│                │  4. warpPerspective  │                  │
-│                │     (BORDER_CONSTANT)│                  │
-│                │                     │                  │
-│                │  5. Multi-scale     │                  │
-│                │     focus maps      │                  │
-│                │     (ksize 3,5,7)   │                  │
-│                │     + Gaussian blur │                  │
-│                │                     │                  │
-│                │  6. Weighted blend  │                  │
-│                │     (soft, no seams)│                  │
-│                │                     │                  │
-│                │  7. Edge fill from  │                  │
-│                │     reference       │                  │
+│  Laplacian     │  POST /api/         │  POST /api/      │
+│  variance per  │  focus-stack        │  generate-       │
+│  pixel         │                     │  packshot        │
+│                │  1. AKAZE features  │                  │
+│  Box blur      │  2. BFMatcher +     │  Multi-provider: │
+│  (radius 3)    │     Lowe's ratio    │  Gemini, OpenAI, │
+│                │  3. findHomography   │  Grok (BYOK)    │
+│  argmax pixel  │     (RANSAC)        │                  │
+│  selection     │  4. warpPerspective  │  System prompt:  │
+│                │  5. Multi-scale     │  pure white bg,  │
+│  No alignment  │     Laplacian       │  zero creativity │
+│  → ghosting    │     (ksize 3,5,7)   │                  │
+│  possible      │  6. Gaussian blur   │                  │
+│                │  7. Weighted blend  │                  │
+│                │  8. Edge fill       │                  │
 └────────────────┴─────────────────────┴──────────────────┘
     │
     ▼
   Canvas Post-Processing (client-side)
-    │
-    ├─ Gamma correction (background/object separate, threshold >240)
+    ├─ Gamma correction (background/object separate)
     ├─ RGB balance (object only)
-    ├─ Vibrance (saturation enhancement)
-    ├─ Sharpen (unsharp mask convolution)
-    └─ Crop (interactive overlay with drag handles)
+    ├─ Vibrance, Sharpen
+    ├─ Interactive crop with drag handles
+    └─ Watermark (Free tier: diagonal tiled, 80% transparent)
     │
     ▼
-  POST /api/convert-to-tiff
-    │
-    ├─ Sharp: PNG → TIFF (LZW compression, 300 DPI)
-    └─ Browser downloads as attachment
+  POST /api/export → TIFF / JPEG / PNG / WebP / AVIF / PSD
 ```
 
 ## Tech Stack
@@ -89,79 +71,146 @@ RAW File Upload (multipart, max 100MB)
 | Animations | Motion (framer-motion) | UI transitions |
 | Build | Vite 6 | Dev server + production build |
 | Backend | Express.js 4 | REST API endpoints |
-| Image Processing | Sharp 0.34 (libvips) | Decode, resize, JPEG/TIFF encode |
-| Computer Vision | @techstark/opencv-js | AKAZE, Homography, warpPerspective |
-| AI (optional) | @google/genai | Gemini 3.1 Flash Image API |
+| Image Processing | Sharp 0.34 (libvips) | Decode, resize, JPEG/TIFF/WebP/AVIF encode |
 | RAW Decoding | librawspeed (LibRaw) | 1181+ cameras, thumbnail + full decode |
-| File Upload | Multer | Multipart form handling |
+| PSD Read/Write | ag-psd | Photoshop file I/O |
+| Computer Vision | @techstark/opencv-js | AKAZE, Homography, warpPerspective (WASM) |
+| AI Providers | @google/genai, openai | Multi-provider packshot generation |
+| Auth | Supabase Auth | JWT, email confirmation, RLS |
+| Database | Supabase (PostgreSQL) | Users, subscriptions, usage, rewards |
+| Billing | PayPal REST API | Subscriptions + one-time payments |
+| Invoicing | iCount API | Israeli receipt (קבלה) generation |
+| CAPTCHA | Cloudflare Turnstile | Registration bot protection |
+| Security | helmet, express-rate-limit | Headers, throttling |
+| Logging | pino | Structured JSON logging |
 
 ## API Endpoints
 
-| Endpoint | Method | Purpose | Input | Output |
-|----------|--------|---------|-------|--------|
-| `/api/ping` | GET | Health check | — | `{ status, timestamp }` |
-| `/api/process-raw` | POST | RAW → JPEG | Multipart RAW file | `{ images: [{ name, base64, mimeType }] }` |
-| `/api/focus-stack` | POST | Aligned stacking | `{ images[], options? }` | `{ result, diagnostics }` |
-| `/api/convert-to-tiff` | POST | Export to TIFF | `{ imageBase64 }` | Binary TIFF (attachment) |
+### Processing
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/process-raw` | Upload RAW/PSD → extract JPEG preview |
+| POST | `/api/focus-stack` | Aligned multi-image stacking (OpenCV WASM) |
+| POST | `/api/export` | Convert to TIFF/JPEG/PNG/WebP/AVIF/PSD |
+
+### AI (server-proxied, key never in client)
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/generate-packshot` | AI studio packshot generation |
+| POST | `/api/homogenize` | AI lighting correction |
+| POST | `/api/edit-packshot` | AI targeted edit via prompt |
+| GET | `/api/ai/providers` | List available AI providers |
+
+### Auth
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/auth/register` | Create account (CAPTCHA required) |
+| POST | `/api/auth/login` | Sign in |
+| POST | `/api/auth/logout` | Sign out |
+| GET | `/api/auth/me` | Current user + usage + subscription |
+
+### Billing (PayPal)
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/billing/create-checkout` | Create PayPal subscription |
+| POST | `/api/billing/buy-credits` | Purchase AI credit pack |
+| POST | `/api/billing/remove-watermark` | One-time watermark removal ($1) |
+| POST | `/api/billing/capture-order` | Capture approved PayPal order |
+| GET | `/api/billing/popup-return` | PayPal popup return + auto-capture |
+| POST | `/api/billing/webhook` | PayPal webhook handler |
+| POST | `/api/billing/cancel` | Cancel subscription |
+| GET | `/api/billing/status` | Current billing status |
+
+### Rewards & Referrals
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/rewards/status` | Watermark credits, AI bonus, referral stats |
+| POST | `/api/rewards/claim-share` | Claim share reward (FB/LinkedIn/X) |
+| GET | `/api/rewards/referral-link` | Get/create referral link |
+| GET | `/api/rewards/active-claims` | List active reward claims |
+
+### Credits & BYOK
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/credits/status` | AI credit balance |
+| POST | `/api/credits/ai-key` | Store BYOK key (encrypted) |
+| GET | `/api/credits/ai-keys` | List BYOK providers |
+| DELETE | `/api/credits/ai-key/:provider` | Remove BYOK key |
 
 ## File Structure
 
 ```
 ├── server.ts                           Express server, all API routes
 ├── src/
-│   ├── main.tsx                        React entry point
-│   ├── App.tsx                         Root component, routing, state
-│   ├── index.css                       Tailwind imports
+│   ├── main.tsx                        React entry point + AuthProvider
+│   ├── App.tsx                         Root component, routing, PayPal return handler
 │   ├── components/
-│   │   ├── ApiKeySelector.tsx          API key input modal (skip or enter)
-│   │   ├── RawUploader.tsx             RAW file upload with drag-drop
-│   │   └── PackshotGenerator.tsx       Main UI: generation, adjustments, crop
+│   │   ├── AuthModal.tsx               Login/register with Turnstile CAPTCHA
+│   │   ├── ErrorBoundary.tsx           Crash recovery UI
+│   │   ├── PackshotGenerator.tsx       Main editor: generation, adjustments, crop, export
+│   │   ├── RawUploader.tsx             RAW/PSD file upload with validation
+│   │   ├── PricingPage.tsx             Tier comparison (Free/Pro/Studio)
+│   │   ├── AccountDashboard.tsx        Usage, credits, billing history, subscription
+│   │   ├── RewardsPage.tsx             Share-to-earn, referral link, milestone
+│   │   ├── UserMenu.tsx                Header dropdown with tier badge
+│   │   ├── AICreditsPanel.tsx          AI credit display + purchase
+│   │   ├── BYOKSettings.tsx            Manage AI provider keys
+│   │   └── LegalPages.tsx              Terms, Privacy, Refund
 │   └── lib/
-│       ├── gemini.ts                   Gemini API client (3 functions)
-│       ├── focus-stack.ts              OpenCV alignment + stacking engine
-│       └── focus-stack-types.ts        TypeScript interfaces
-├── benchmark.mjs                       Performance benchmark script
-├── RESULTS.md                          Benchmark data and comparison
-├── ARCHITECTURE.md                     This file
-└── README.md                           Setup and usage guide
+│       ├── auth-context.tsx            React context: user state, billing actions
+│       ├── auth/
+│       │   ├── middleware.ts           JWT verification, optionalAuth, tier override
+│       │   └── routes.ts              Register, login, logout, email confirmation
+│       ├── billing/
+│       │   ├── paypal.ts              PayPal REST client (subscriptions, orders)
+│       │   └── routes.ts             Billing routes (checkout, webhook, cancel)
+│       ├── invoicing/
+│       │   └── icount.ts             Israeli receipt generation (קבלה)
+│       ├── credits/
+│       │   ├── ai-credits.ts         AI credit tracking + BYOK provider resolution
+│       │   ├── byok.ts               AES-256 encryption for user API keys
+│       │   └── routes.ts             Credit status + BYOK endpoints
+│       ├── rewards/
+│       │   ├── rewards.ts            Reward ledger: grant, consume, query
+│       │   └── routes.ts             Share claims, referral links, status
+│       ├── tier/
+│       │   ├── limits.ts             Tier definitions, quota middleware, format gating
+│       │   └── watermark.ts          Diagonal tiled watermark generation
+│       ├── ai-providers/
+│       │   ├── types.ts              AIProvider adapter interface
+│       │   ├── gemini.ts             Google Gemini adapter
+│       │   ├── openai.ts             OpenAI GPT-4o adapter
+│       │   ├── grok.ts               xAI Grok adapter
+│       │   └── registry.ts           Provider factory + selection logic
+│       ├── studio-api/
+│       │   ├── api-auth.ts           API key authentication middleware
+│       │   ├── api-keys.ts           Generate/list/revoke API keys
+│       │   ├── v1-routes.ts          REST API v1 endpoints
+│       │   └── webhooks.ts           Webhook management + delivery
+│       ├── email/
+│       │   └── notifications.ts      Email queue (welcome, subscription, usage)
+│       ├── db/
+│       │   └── supabase.ts           Supabase client + DB helpers
+│       ├── focus-stack.ts            OpenCV alignment + compositing engine
+│       └── focus-stack-types.ts      TypeScript types for focus stacking
+├── supabase/
+│   └── migrations/                   Database schema (5 migrations)
+├── tests/
+│   └── api.test.ts                   Integration tests (19 tests)
+├── Dockerfile                        Multi-stage Alpine production build
+├── docker-compose.yml                Dev/prod service config
+├── .github/workflows/ci.yml          Build + test on push/PR
+└── RESULTS.md                        Performance benchmarks
 ```
 
-## Aligned Focus Stack Pipeline Detail
+## Security
 
-### 1. Reference Selection
-Compute global Laplacian variance on each image. The image with the highest variance has the most in-focus area overall and becomes the alignment target.
-
-### 2. Feature Detection (AKAZE)
-AKAZE (Accelerated-KAZE) detects keypoints that are invariant to scale and rotation. Binary descriptors allow fast Hamming distance matching. Typical yield: 800-2600 keypoints per 2048x1365 image.
-
-### 3. Feature Matching
-BFMatcher with Hamming distance + Lowe's ratio test (threshold 0.75). The ratio test compares the best match distance to the second-best — if they're too similar, the match is ambiguous and rejected. Typical yield: 800-2600 good matches.
-
-### 4. Homography (RANSAC)
-`findHomography` with RANSAC (reprojection threshold 3.0px) estimates a 3x3 perspective transform. RANSAC iteratively selects random point subsets, fits a model, and counts inliers. Typical inlier rate: 95-99%.
-
-Validation: reject if determinant of H is outside [0.1, 10] (degenerate transform).
-
-### 5. Warping
-`warpPerspective` maps each source image into the reference coordinate space. Black regions outside the original frame get alpha=0, used later for masking.
-
-### 6. Multi-Scale Focus Maps
-Three Laplacian kernels (ksize 3, 5, 7) capture fine, medium, and coarse defocus. Weighted 50/30/20. Gaussian blur (sigma=5) smooths the maps to prevent abrupt transitions.
-
-### 7. Weighted Compositing
-Focus maps are normalized per-pixel (sum=1.0), then Gaussian-blurred again for soft blending. Each pixel is a weighted average of all aligned images, dominated by whichever image is sharpest at that location.
-
-### 8. Edge Handling
-Warped images have black borders. The reference image (never warped) fills these gaps. This preserves full-frame output — edges are typically plain background anyway.
-
-## Graceful Degradation
-
-| Failure | Detection | Recovery |
-|---------|-----------|----------|
-| <10 features | `keypoints.size() < 10` | Use image unaligned |
-| <10 matches | After ratio test | Use image unaligned |
-| Bad homography | `abs(det(H))` outside [0.1, 10] | Use image unaligned |
-| All alignments fail | No successfully aligned images | Fall back to unaligned stack |
-| WASM out of memory | Try/catch on cv operations | Return 500 with message |
-
-Every failure is logged in `diagnostics.alignments[].warning`.
+- **Helmet** — HSTS, X-Frame-Options, CSP (strict in production, relaxed in dev for Vite HMR)
+- **Rate limiting** — API: 100/15min, Upload: 20/15min, Processing: 10/min
+- **CORS** — Explicit origin whitelist in production
+- **CAPTCHA** — Cloudflare Turnstile on registration
+- **File validation** — Magic byte checks prevent extension spoofing
+- **API keys** — Server-side only, never in client bundle
+- **BYOK encryption** — AES-256-CBC with random IVs
+- **RLS** — Row-level security on all Supabase tables
+- **JWT cookies** — HttpOnly, Secure, SameSite=Lax
