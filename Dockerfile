@@ -21,7 +21,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 # Copy backend source
 COPY server.ts ./
-COPY src/lib/focus-stack.ts src/lib/focus-stack-types.ts ./src/lib/
+COPY src/lib/ ./src/lib/
 
 # Copy frontend build
 COPY --from=builder /app/dist ./dist

@@ -15,9 +15,10 @@ interface AuthModalProps {
   isOpen: boolean;
   onClose: () => void;
   defaultTab?: 'login' | 'register';
+  resetToken?: string | null;
 }
 
-export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, defaultTab = 'login' }) => {
+export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, defaultTab = 'login', resetToken }) => {
   const { login, register } = useAuth();
   const [tab, setTab] = useState<'login' | 'register'>(defaultTab);
   const [email, setEmail] = useState('');
@@ -31,6 +32,12 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, defaultTa
   const [confirmationEmail, setConfirmationEmail] = useState('');
   const [resending, setResending] = useState(false);
   const [turnstileKey, setTurnstileKey] = useState(0);
+  const [forgotPassword, setForgotPassword] = useState(false);
+  const [forgotEmail, setForgotEmail] = useState('');
+  const [forgotSent, setForgotSent] = useState(false);
+  const [resetMode, setResetMode] = useState(!!resetToken);
+  const [newPassword, setNewPassword] = useState('');
+  const [resetSuccess, setResetSuccess] = useState(false);
 
   if (!isOpen) return null;
 
@@ -149,6 +156,124 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, defaultTa
               Close
             </button>
           </div>
+        </div>
+      </div>,
+      document.body
+    );
+  }
+
+  // Password reset flow (user clicked link from email)
+  if (resetMode && resetToken) {
+    const handleResetPassword = async (e: React.FormEvent) => {
+      e.preventDefault();
+      setError('');
+      setLoading(true);
+      try {
+        const res = await fetch('/api/auth/reset-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ access_token: resetToken, new_password: newPassword }),
+        });
+        const data = await res.json();
+        if (!res.ok) { setError(data.error); return; }
+        setResetSuccess(true);
+      } finally { setLoading(false); }
+    };
+
+    return createPortal(
+      <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4" role="dialog" aria-modal="true">
+        <div className="bg-[#151619] border border-white/10 rounded-2xl max-w-md w-full p-8 shadow-2xl space-y-6">
+          {resetSuccess ? (
+            <>
+              <h2 className="text-xl font-bold text-white uppercase tracking-tight text-center">Password Updated</h2>
+              <p className="text-sm text-gray-400 text-center">Your password has been changed. You can now sign in.</p>
+              <button
+                onClick={() => { setResetMode(false); setResetSuccess(false); }}
+                className="w-full py-3 bg-orange-500 hover:bg-orange-600 text-white rounded-xl transition-all text-xs font-bold uppercase tracking-widest"
+              >Go to Sign In</button>
+            </>
+          ) : (
+            <form onSubmit={handleResetPassword} className="space-y-4">
+              <h2 className="text-xl font-bold text-white uppercase tracking-tight text-center">Set New Password</h2>
+              <div>
+                <label className="block text-[10px] font-mono uppercase tracking-widest text-gray-500 mb-2">New Password</label>
+                <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)} placeholder="At least 8 characters" required minLength={8}
+                  className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white text-sm placeholder:text-gray-600 focus:outline-none focus:border-orange-500/50 transition-colors" autoFocus />
+              </div>
+              {error && (
+                <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm">
+                  <AlertCircle className="w-4 h-4 shrink-0" /><span>{error}</span>
+                </div>
+              )}
+              <button type="submit" disabled={loading}
+                className="w-full bg-orange-500 hover:bg-orange-600 disabled:bg-gray-800 disabled:text-gray-600 text-white font-bold py-4 rounded-xl transition-all uppercase tracking-widest text-xs">
+                {loading ? 'Updating...' : 'Update Password'}
+              </button>
+            </form>
+          )}
+        </div>
+      </div>,
+      document.body
+    );
+  }
+
+  // Forgot password flow
+  if (forgotPassword) {
+    const handleForgotSubmit = async (e: React.FormEvent) => {
+      e.preventDefault();
+      setError('');
+      setLoading(true);
+      try {
+        const res = await fetch('/api/auth/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: forgotEmail }),
+        });
+        const data = await res.json();
+        if (!res.ok) { setError(data.error); return; }
+        setForgotSent(true);
+      } finally { setLoading(false); }
+    };
+
+    return createPortal(
+      <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4" role="dialog" aria-modal="true">
+        <div className="bg-[#151619] border border-white/10 rounded-2xl max-w-md w-full p-8 shadow-2xl space-y-6">
+          {forgotSent ? (
+            <>
+              <div className="w-16 h-16 mx-auto bg-green-500/10 rounded-full flex items-center justify-center">
+                <Mail className="w-8 h-8 text-green-500" />
+              </div>
+              <h2 className="text-xl font-bold text-white uppercase tracking-tight text-center">Check Your Email</h2>
+              <p className="text-sm text-gray-400 text-center">If an account exists for <span className="text-white font-medium">{forgotEmail}</span>, we sent a password reset link.</p>
+              <button onClick={() => { setForgotPassword(false); setForgotSent(false); }}
+                className="w-full py-3 bg-orange-500 hover:bg-orange-600 text-white rounded-xl transition-all text-xs font-bold uppercase tracking-widest">
+                Back to Sign In
+              </button>
+            </>
+          ) : (
+            <form onSubmit={handleForgotSubmit} className="space-y-4">
+              <h2 className="text-xl font-bold text-white uppercase tracking-tight text-center">Reset Password</h2>
+              <p className="text-sm text-gray-500 text-center">Enter your email and we'll send a reset link.</p>
+              <div>
+                <label className="block text-[10px] font-mono uppercase tracking-widest text-gray-500 mb-2">Email</label>
+                <input type="email" value={forgotEmail} onChange={e => setForgotEmail(e.target.value)} placeholder="you@example.com" required
+                  className="w-full px-4 py-3 bg-white/5 border border-white/10 rounded-xl text-white text-sm placeholder:text-gray-600 focus:outline-none focus:border-orange-500/50 transition-colors" autoFocus />
+              </div>
+              {error && (
+                <div className="flex items-center gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm">
+                  <AlertCircle className="w-4 h-4 shrink-0" /><span>{error}</span>
+                </div>
+              )}
+              <button type="submit" disabled={loading}
+                className="w-full bg-orange-500 hover:bg-orange-600 disabled:bg-gray-800 disabled:text-gray-600 text-white font-bold py-4 rounded-xl transition-all uppercase tracking-widest text-xs">
+                {loading ? 'Sending...' : 'Send Reset Link'}
+              </button>
+              <button type="button" onClick={() => setForgotPassword(false)}
+                className="w-full text-xs text-gray-600 hover:text-gray-400 transition-colors text-center">
+                Back to Sign In
+              </button>
+            </form>
+          )}
         </div>
       </div>,
       document.body
@@ -278,12 +403,19 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, defaultTa
         </form>
 
         {tab === 'login' && (
-          <p className="text-center text-[10px] text-gray-600 font-mono uppercase tracking-widest mt-6">
-            Don't have an account?{' '}
-            <button onClick={() => switchTab('register')} className="text-orange-500 hover:text-orange-400">
-              Create one
-            </button>
-          </p>
+          <div className="text-center mt-6 space-y-2">
+            <p className="text-[10px] text-gray-600 font-mono uppercase tracking-widest">
+              <button onClick={() => { setForgotPassword(true); setForgotEmail(email); }} className="text-gray-500 hover:text-orange-400 transition-colors">
+                Forgot password?
+              </button>
+            </p>
+            <p className="text-[10px] text-gray-600 font-mono uppercase tracking-widest">
+              Don't have an account?{' '}
+              <button onClick={() => switchTab('register')} className="text-orange-500 hover:text-orange-400">
+                Create one
+              </button>
+            </p>
+          </div>
         )}
         {tab === 'register' && (
           <p className="text-center text-[10px] text-gray-600 font-mono uppercase tracking-widest mt-6">

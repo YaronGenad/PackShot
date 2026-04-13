@@ -504,31 +504,6 @@ async function startServer() {
     }
   });
 
-  // ── Gemini API key management — key stays server-side in memory ─────────
-
-  /** Runtime API key — set via env or user input, never sent to client. */
-  let geminiApiKey = process.env.GEMINI_API_KEY || '';
-
-  app.get("/api/has-gemini-key", (_req, res) => {
-    res.json({ hasKey: !!geminiApiKey });
-  });
-
-  app.post("/api/set-gemini-key", (req, res) => {
-    const { key } = req.body;
-    if (!key || typeof key !== 'string' || key.length < 10) {
-      return res.status(400).json({ error: 'Invalid API key' });
-    }
-    geminiApiKey = key;
-    log.info('Gemini API key set via UI');
-    res.json({ success: true });
-  });
-
-  app.post("/api/reset-gemini-key", (_req, res) => {
-    geminiApiKey = '';
-    log.info('Gemini API key reset');
-    res.json({ success: true });
-  });
-
   // ── AI provider info ──────────────────────────────────────────────────
 
   /** List available AI providers and which the user has BYOK keys for. */
@@ -544,13 +519,14 @@ async function startServer() {
   // ── AI proxy endpoints — multi-provider via adapter pattern ─────────
 
   /**
-   * Fallback: get a Gemini provider using server key (for legacy key management
-   * endpoints and when checkAICredits middleware hasn't run).
+   * Fallback: get a Gemini provider using server env key
+   * when checkAICredits middleware hasn't resolved a provider.
    */
   const getFallbackProvider = () => {
-    if (!geminiApiKey) throw new Error('GEMINI_API_KEY not configured. Enter a key or set GEMINI_API_KEY env var.');
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) throw new Error('GEMINI_API_KEY not configured. Set GEMINI_API_KEY env var.');
     const { GeminiProvider } = require('./src/lib/ai-providers/gemini.js');
-    return new GeminiProvider(geminiApiKey);
+    return new GeminiProvider(key);
   };
 
   /** Generate studio packshot — uses resolved provider from checkAICredits. */
@@ -633,9 +609,27 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     log.info(`Server running on http://localhost:${PORT}`);
   });
+
+  // Graceful shutdown — drain connections before exiting
+  const shutdown = (signal: string) => {
+    log.info(`${signal} received — shutting down gracefully`);
+    server.close(() => {
+      log.info('All connections drained, exiting');
+      process.exit(0);
+    });
+    // Force exit after 10s if connections don't drain
+    setTimeout(() => {
+      log.warn('Forced shutdown after timeout');
+      process.exit(1);
+    }, 10_000).unref();
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
   } catch (e) {
     log.error({ err: e }, 'Server startup error');
     process.exit(1);

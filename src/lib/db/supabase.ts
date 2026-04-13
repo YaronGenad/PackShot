@@ -26,7 +26,9 @@ export const supabaseAdmin: SupabaseClient = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
-/** Get or create usage record for a user in a given month. */
+/** Get or create usage record for a user in a given month.
+ *  When creating a new month, carries forward purchased credits from the most recent prior month
+ *  (purchased credits never expire). */
 export async function getOrCreateUsage(userId: string, month?: string) {
   const currentMonth = month || new Date().toISOString().slice(0, 7); // YYYY-MM
 
@@ -39,10 +41,29 @@ export async function getOrCreateUsage(userId: string, month?: string) {
 
   if (existing) return existing;
 
+  // Carry forward purchased credits from the most recent prior month
+  let carryForwardCredits = 0;
+  const { data: previous } = await supabaseAdmin
+    .from('usage')
+    .select('ai_credits_purchased')
+    .eq('user_id', userId)
+    .lt('month', currentMonth)
+    .order('month', { ascending: false })
+    .limit(1)
+    .single();
+
+  if (previous?.ai_credits_purchased) {
+    carryForwardCredits = previous.ai_credits_purchased;
+  }
+
   // Create new usage record for this month
   const { data: created, error } = await supabaseAdmin
     .from('usage')
-    .insert({ user_id: userId, month: currentMonth })
+    .insert({
+      user_id: userId,
+      month: currentMonth,
+      ai_credits_purchased: carryForwardCredits,
+    })
     .select()
     .single();
 
@@ -50,26 +71,42 @@ export async function getOrCreateUsage(userId: string, month?: string) {
   return created;
 }
 
-/** Increment deterministic image count for current month. */
+/** Increment deterministic image count for current month (atomic). */
 export async function incrementDeterministicCount(userId: string) {
   const usage = await getOrCreateUsage(userId);
-  const { error } = await supabaseAdmin
-    .from('usage')
-    .update({ deterministic_count: usage.deterministic_count + 1 })
-    .eq('id', usage.id);
-  if (error) throw new Error(`Failed to increment usage: ${error.message}`);
-  return usage.deterministic_count + 1;
+  const { data, error } = await supabaseAdmin.rpc('increment_usage_field', {
+    row_id: usage.id,
+    field_name: 'deterministic_count',
+  });
+  if (error) {
+    // Fallback to non-atomic increment if RPC not yet deployed
+    const { error: updateErr } = await supabaseAdmin
+      .from('usage')
+      .update({ deterministic_count: usage.deterministic_count + 1 })
+      .eq('id', usage.id);
+    if (updateErr) throw new Error(`Failed to increment usage: ${updateErr.message}`);
+    return usage.deterministic_count + 1;
+  }
+  return data;
 }
 
-/** Increment AI usage count for current month. */
+/** Increment AI usage count for current month (atomic). */
 export async function incrementAICount(userId: string) {
   const usage = await getOrCreateUsage(userId);
-  const { error } = await supabaseAdmin
-    .from('usage')
-    .update({ ai_count: usage.ai_count + 1 })
-    .eq('id', usage.id);
-  if (error) throw new Error(`Failed to increment AI usage: ${error.message}`);
-  return usage.ai_count + 1;
+  const { data, error } = await supabaseAdmin.rpc('increment_usage_field', {
+    row_id: usage.id,
+    field_name: 'ai_count',
+  });
+  if (error) {
+    // Fallback to non-atomic increment if RPC not yet deployed
+    const { error: updateErr } = await supabaseAdmin
+      .from('usage')
+      .update({ ai_count: usage.ai_count + 1 })
+      .eq('id', usage.id);
+    if (updateErr) throw new Error(`Failed to increment AI usage: ${updateErr.message}`);
+    return usage.ai_count + 1;
+  }
+  return data;
 }
 
 /** Get user profile by ID. */

@@ -181,7 +181,9 @@ export function getAIProviderName(req: any): ProviderName | null {
 
 /**
  * Add purchased credits to a user's account.
- * Called from Stripe webhook on successful credit pack payment.
+ * Called from PayPal webhook on successful credit pack payment.
+ * Credits are stored on the current month's usage row and carried forward
+ * automatically when a new month's row is created (see getOrCreateUsage).
  */
 export async function addPurchasedCredits(userId: string, credits: number) {
   const currentMonth = new Date().toISOString().slice(0, 7);

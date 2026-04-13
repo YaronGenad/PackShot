@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Camera, Layers, Sparkles, Info, Github, ExternalLink, Cpu, Tag, LayoutDashboard, Gift } from 'lucide-react';
+import { Camera, Layers, Sparkles, Info, Github, ExternalLink, Cpu, Tag, LayoutDashboard, Gift, Menu, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { RawUploader } from './components/RawUploader';
@@ -10,6 +10,7 @@ import { AccountDashboard } from './components/AccountDashboard';
 import { BYOKSettings } from './components/BYOKSettings';
 import { LegalPages } from './components/LegalPages';
 import { RewardsPage } from './components/RewardsPage';
+import { AuthModal } from './components/AuthModal';
 import { useAuth } from './lib/auth-context';
 
 type Page = 'home' | 'pricing' | 'account' | 'legal' | 'rewards';
@@ -21,6 +22,10 @@ export default function App() {
   const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'error'>('checking');
   const [showBYOK, setShowBYOK] = useState(false);
   const [paymentToast, setPaymentToast] = useState<string | null>(null);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [resetToken, setResetToken] = useState<string | null>(null);
+  const [showResetModal, setShowResetModal] = useState(false);
+  const [cookieConsent, setCookieConsent] = useState(() => localStorage.getItem('cookie-consent') === 'accepted');
 
   // Auto-dismiss payment toast
   useEffect(() => {
@@ -40,6 +45,20 @@ export default function App() {
     };
     window.addEventListener('packshot:navigate', handleNav);
     return () => window.removeEventListener('packshot:navigate', handleNav);
+  }, []);
+
+  // Handle password reset token from URL hash (Supabase redirects with #access_token=...)
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (hash.includes('access_token=') && (hash.includes('type=recovery') || new URLSearchParams(window.location.search).get('reset-password'))) {
+      const params = new URLSearchParams(hash.replace('#', ''));
+      const token = params.get('access_token');
+      if (token) {
+        setResetToken(token);
+        setShowResetModal(true);
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+    }
   }, []);
 
   // Handle PayPal return URLs and checkout query params on load
@@ -153,6 +172,15 @@ export default function App() {
             </div>
           </button>
 
+          {/* Mobile hamburger */}
+          <button
+            onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+            className="md:hidden text-gray-400 hover:text-white transition-colors p-2"
+            aria-label="Toggle menu"
+          >
+            {mobileMenuOpen ? <X className="w-6 h-6" /> : <Menu className="w-6 h-6" />}
+          </button>
+
           <nav className="hidden md:flex items-center space-x-4">
             <button
               onClick={() => setPage('pricing')}
@@ -201,6 +229,40 @@ export default function App() {
           </nav>
         </div>
       </header>
+
+      {/* Mobile Navigation Drawer */}
+      <AnimatePresence>
+        {mobileMenuOpen && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            className="relative z-10 md:hidden border-b border-white/5 bg-black/80 backdrop-blur-xl overflow-hidden"
+          >
+            <nav className="flex flex-col p-4 space-y-2">
+              <button onClick={() => { setPage('pricing'); setMobileMenuOpen(false); }}
+                className={`flex items-center gap-2 px-4 py-3 rounded-xl text-xs font-mono uppercase tracking-widest transition-colors ${page === 'pricing' ? 'bg-orange-500/10 text-orange-400' : 'text-gray-400 hover:text-white'}`}>
+                <Tag className="w-4 h-4" /> Pricing
+              </button>
+              {user && (
+                <>
+                  <button onClick={() => { setPage('rewards'); setMobileMenuOpen(false); }}
+                    className={`flex items-center gap-2 px-4 py-3 rounded-xl text-xs font-mono uppercase tracking-widest transition-colors ${page === 'rewards' ? 'bg-orange-500/10 text-orange-400' : 'text-gray-400 hover:text-white'}`}>
+                    <Gift className="w-4 h-4" /> Rewards
+                  </button>
+                  <button onClick={() => { setPage('account'); setMobileMenuOpen(false); }}
+                    className={`flex items-center gap-2 px-4 py-3 rounded-xl text-xs font-mono uppercase tracking-widest transition-colors ${page === 'account' ? 'bg-orange-500/10 text-orange-400' : 'text-gray-400 hover:text-white'}`}>
+                    <LayoutDashboard className="w-4 h-4" /> Account
+                  </button>
+                </>
+              )}
+              <div className="pt-2 border-t border-white/5">
+                <UserMenu />
+              </div>
+            </nav>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Page Content */}
       <AnimatePresence mode="wait">
@@ -369,11 +431,8 @@ export default function App() {
           </div>
 
           <div className="flex items-center space-x-6">
-            <a href="#" className="text-gray-600 hover:text-white transition-colors">
-              <Github className="w-5 h-5" />
-            </a>
-            <a href="#" className="text-gray-600 hover:text-white transition-colors">
-              <ExternalLink className="w-5 h-5" />
+            <a href="mailto:support@pack-shot.studio" className="text-gray-600 hover:text-white transition-colors text-[10px] font-mono uppercase tracking-widest">
+              Support
             </a>
           </div>
         </div>
@@ -381,6 +440,34 @@ export default function App() {
 
       {/* BYOK Modal (accessible from account dashboard) */}
       <BYOKSettings isOpen={showBYOK} onClose={() => setShowBYOK(false)} />
+
+      {/* Password Reset Modal (triggered from email link) */}
+      {showResetModal && (
+        <AuthModal
+          isOpen={true}
+          onClose={() => { setShowResetModal(false); setResetToken(null); }}
+          resetToken={resetToken}
+        />
+      )}
+
+      {/* Cookie Consent Banner */}
+      {!cookieConsent && (
+        <div className="fixed bottom-0 left-0 right-0 z-[150] bg-[#151619] border-t border-white/10 p-4 md:p-6">
+          <div className="max-w-4xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+            <p className="text-xs text-gray-400 text-center md:text-left">
+              We use essential cookies for authentication and functionality. No tracking cookies are used.
+              By continuing, you accept our{' '}
+              <button onClick={() => setPage('legal')} className="text-orange-400 hover:text-orange-300 underline">Privacy Policy</button>.
+            </p>
+            <button
+              onClick={() => { setCookieConsent(true); localStorage.setItem('cookie-consent', 'accepted'); }}
+              className="shrink-0 px-6 py-2 bg-orange-500 hover:bg-orange-600 text-white text-xs font-bold uppercase tracking-widest rounded-lg transition-colors"
+            >
+              Accept
+            </button>
+          </div>
+        </div>
+      )}
     </div>
     </ErrorBoundary>
   );

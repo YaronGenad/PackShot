@@ -26,9 +26,10 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL || 'http://localhost:54321' }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY || 'test-key' }}
       SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY || 'test-key' }}
-      # Stripe (test mode)
-      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY || '' }}
-      STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET || '' }}
+      # PayPal (test mode)
+      PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID || '' }}
+      PAYPAL_SECRET: ${{ secrets.PAYPAL_SECRET || '' }}
+      PAYPAL_WEBHOOK_ID: ${{ secrets.PAYPAL_WEBHOOK_ID || '' }}
       # General
       NODE_ENV: test
       ALLOWED_ORIGINS: http://localhost:3000

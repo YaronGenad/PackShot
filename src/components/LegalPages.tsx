@@ -87,7 +87,7 @@ function TermsOfService() {
 
       <h2>5. Payments &amp; Billing</h2>
       <ul>
-        <li>Payments are processed by Stripe. By subscribing you agree to Stripe's terms.</li>
+        <li>Payments are processed by PayPal. By subscribing you agree to PayPal's terms.</li>
         <li>Subscriptions auto-renew. Cancel anytime via the billing portal.</li>
         <li>AI credits are non-refundable once used. Unused purchased credits do not expire.</li>
       </ul>
@@ -122,7 +122,7 @@ function PrivacyPolicy() {
       <h2>1. Data We Collect</h2>
       <ul>
         <li><strong>Account data:</strong> email, name, password hash (managed by Supabase Auth).</li>
-        <li><strong>Billing data:</strong> handled by Stripe. We store only your Stripe customer ID, not card numbers.</li>
+        <li><strong>Billing data:</strong> handled by PayPal. We store only your PayPal payer ID, not card numbers.</li>
         <li><strong>Usage data:</strong> image counts, AI credit usage, feature usage (for quota enforcement).</li>
         <li><strong>Images:</strong> uploaded temporarily for processing, then immediately deleted. We do not store your images.</li>
         <li><strong>BYOK keys:</strong> encrypted at rest (AES-256-CBC). Used only for API calls on your behalf.</li>
@@ -139,7 +139,7 @@ function PrivacyPolicy() {
       <h2>3. Data Sharing</h2>
       <ul>
         <li>We do not sell your personal data.</li>
-        <li>We share data with: Supabase (database/auth), Stripe (payments), and your selected AI provider (BYOK keys, image data for processing).</li>
+        <li>We share data with: Supabase (database/auth), PayPal (payments), and your selected AI provider (BYOK keys, image data for processing).</li>
         <li>AI providers may have their own data retention policies. Check their terms when using BYOK.</li>
       </ul>
 
@@ -151,7 +151,7 @@ function PrivacyPolicy() {
       </ul>
 
       <h2>5. Your Rights</h2>
-      <p>You may request data export or deletion by contacting support. We comply with applicable data protection laws.</p>
+      <p>You may request data export or deletion by contacting <a href="mailto:support@pack-shot.studio">support@pack-shot.studio</a>. We comply with applicable data protection laws.</p>
 
       <h2>6. Security</h2>
       <p>We use HTTPS, encrypted storage, row-level security, and industry-standard practices. However, no system is 100% secure.</p>
@@ -189,7 +189,7 @@ function RefundPolicy() {
       </ul>
 
       <h2>How to Request a Refund</h2>
-      <p>Contact support with your account email and the charge date. Refunds are processed to the original payment method within 5-10 business days.</p>
+      <p>Contact us at <a href="mailto:support@pack-shot.studio">support@pack-shot.studio</a> with your account email and the charge date. Refunds are processed to the original payment method within 5-10 business days.</p>
     </div>
   );
 }

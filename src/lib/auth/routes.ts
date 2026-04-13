@@ -267,4 +267,61 @@ router.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Respons
   }
 });
 
+/**
+ * POST /api/auth/forgot-password — Send password reset email.
+ */
+router.post('/forgot-password', async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    const supabaseClient = createClient(supabaseUrl, supabaseAnonKey);
+    const redirectTo = `${process.env.APP_URL || 'http://localhost:3000'}/?reset-password=true`;
+    const { error } = await supabaseClient.auth.resetPasswordForEmail(email, { redirectTo });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    // Always return success (don't reveal whether email exists)
+    res.json({ message: 'If an account with that email exists, a reset link has been sent.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to send reset email' });
+  }
+});
+
+/**
+ * POST /api/auth/reset-password — Set new password using access token from reset email.
+ */
+router.post('/reset-password', async (req: Request, res: Response) => {
+  try {
+    const { access_token, new_password } = req.body;
+    if (!access_token || !new_password) {
+      return res.status(400).json({ error: 'Access token and new password are required' });
+    }
+    if (new_password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    const supabaseClient = createClient(supabaseUrl, supabaseAnonKey);
+    // Set the session from the reset token
+    const { error: sessionError } = await supabaseClient.auth.setSession({
+      access_token,
+      refresh_token: '', // Not needed for password update
+    });
+    if (sessionError) {
+      return res.status(400).json({ error: 'Invalid or expired reset link. Please request a new one.' });
+    }
+
+    const { error } = await supabaseClient.auth.updateUser({ password: new_password });
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({ message: 'Password updated successfully. You can now sign in.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to reset password' });
+  }
+});
+
 export { router as authRouter };

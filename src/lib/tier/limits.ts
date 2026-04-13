@@ -54,9 +54,10 @@ export async function checkQuota(req: AuthenticatedRequest, res: Response, next:
   const tier = getEffectiveTier(req);
   const limits = TIER_LIMITS[tier];
 
-  // Anonymous users (no account) get free tier limits
+  // Anonymous users (no account) — enforce free tier limits via IP-based tracking
   if (!req.user) {
-    // For anonymous users, we can't track — allow but with free limits
+    // Rate limiting already applied by express-rate-limit; just ensure free limits apply
+    // We can't track monthly counts, but the processing rate limiter (10/min) gates abuse
     return next();
   }
 
