@@ -22,7 +22,7 @@ const TIER_LABELS = {
 };
 
 export const UserMenu: React.FC = () => {
-  const { user, usage, loading, logout, openBillingPortal, createCheckout } = useAuth();
+  const { user, usage, loading, logout, openBillingPortal } = useAuth();
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authTab, setAuthTab] = useState<'login' | 'register'>('login');
   const [showDropdown, setShowDropdown] = useState(false);
@@ -125,7 +125,7 @@ export const UserMenu: React.FC = () => {
           <div className="p-2">
             {tier === 'free' && (
               <button
-                onClick={() => { createCheckout('pro'); setShowDropdown(false); }}
+                onClick={() => { setShowDropdown(false); window.dispatchEvent(new CustomEvent('packshot:navigate', { detail: 'pricing' })); }}
                 className="w-full flex items-center gap-3 px-3 py-2.5 text-orange-400 hover:bg-orange-500/10 rounded-lg transition-colors text-left"
               >
                 <Crown className="w-4 h-4" />
@@ -134,7 +134,7 @@ export const UserMenu: React.FC = () => {
             )}
             {tier === 'pro' && (
               <button
-                onClick={() => { createCheckout('studio'); setShowDropdown(false); }}
+                onClick={() => { setShowDropdown(false); window.dispatchEvent(new CustomEvent('packshot:navigate', { detail: 'pricing' })); }}
                 className="w-full flex items-center gap-3 px-3 py-2.5 text-purple-400 hover:bg-purple-500/10 rounded-lg transition-colors text-left"
               >
                 <Zap className="w-4 h-4" />

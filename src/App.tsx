@@ -15,11 +15,20 @@ import { useAuth } from './lib/auth-context';
 type Page = 'home' | 'pricing' | 'account' | 'legal' | 'rewards';
 
 export default function App() {
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const [page, setPage] = useState<Page>('home');
   const [processedImages, setProcessedImages] = useState<{ name: string, base64: string, mimeType: string }[]>([]);
   const [apiStatus, setApiStatus] = useState<'checking' | 'ok' | 'error'>('checking');
   const [showBYOK, setShowBYOK] = useState(false);
+  const [paymentToast, setPaymentToast] = useState<string | null>(null);
+
+  // Auto-dismiss payment toast
+  useEffect(() => {
+    if (paymentToast) {
+      const t = setTimeout(() => setPaymentToast(null), 5000);
+      return () => clearTimeout(t);
+    }
+  }, [paymentToast]);
 
   // Listen for navigation events fired from deeply-nested components
   useEffect(() => {
@@ -41,29 +50,48 @@ export default function App() {
 
     if (subscriptionId) {
       // Subscription was approved — webhook will handle the tier update
-      setPage('account');
+      refreshUser().then(() => {
+        setPage('account');
+        setPaymentToast('Subscription activated! Welcome aboard.');
+      });
       window.history.replaceState({}, '', window.location.pathname);
       return;
     }
 
     if (orderToken && !subscriptionId) {
-      // One-time order approved — capture it
+      // One-time order approved — capture it. Determine type from URL params.
+      const isWatermark = params.get('watermark') === 'removed';
       fetch('/api/billing/capture-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({ orderId: orderToken }),
-      }).then(() => {
-        setPage('account');
+      }).then(() => refreshUser()).then(() => {
+        if (isWatermark) {
+          // Don't navigate — user stays on current page with their processed image intact
+          setPaymentToast('Watermark credit added! Check the box below Download to use it.');
+        } else {
+          setPage('account');
+          setPaymentToast('Payment successful!');
+        }
         window.history.replaceState({}, '', window.location.pathname);
       }).catch(() => {
         window.history.replaceState({}, '', window.location.pathname);
       });
-      return;
+      return; // Don't fall through to the watermark check below
     }
 
-    if (params.get('checkout') === 'success' || params.get('credits') === 'success' || params.get('watermark') === 'removed') {
-      setPage('account');
+    if (params.get('watermark') === 'removed' && !orderToken) {
+      // Watermark return without token — don't navigate, just refresh rewards
+      refreshUser().then(() => {
+        setPaymentToast('Watermark credit added! Check the box below Download to use it.');
+      });
+      window.history.replaceState({}, '', window.location.pathname);
+    } else if (params.get('checkout') === 'success' || params.get('credits') === 'success') {
+      refreshUser().then(() => {
+        setPage('account');
+        setPaymentToast('Payment successful!');
+      });
       window.history.replaceState({}, '', window.location.pathname);
     }
   }, []);
@@ -90,6 +118,20 @@ export default function App() {
   return (
     <ErrorBoundary>
     <div className="min-h-screen bg-[#0a0b0d] text-gray-300 font-sans selection:bg-orange-500/30 selection:text-orange-200">
+
+      {/* Payment success toast */}
+      <AnimatePresence>
+        {paymentToast && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -20 }}
+            className="fixed top-4 left-1/2 -translate-x-1/2 z-[200] px-6 py-3 bg-green-500 text-white rounded-xl shadow-2xl text-sm font-bold"
+          >
+            {paymentToast}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Background Atmosphere */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none">

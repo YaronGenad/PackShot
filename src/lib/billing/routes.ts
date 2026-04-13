@@ -143,7 +143,7 @@ router.post('/remove-watermark', authMiddleware, async (req: AuthenticatedReques
       'USD',
       'Watermark Removal (one-time)',
       `${user.id}:watermark`,
-      `${appUrl}/?watermark=removed`,
+      `${appUrl}/api/billing/popup-return?type=watermark`,
       `${appUrl}/?watermark=cancelled`,
     );
 
@@ -152,6 +152,48 @@ router.post('/remove-watermark', authMiddleware, async (req: AuthenticatedReques
     console.error('remove-watermark error:', err);
     res.status(500).json({ error: 'Failed to create checkout session', details: err.message });
   }
+});
+
+/**
+ * GET /api/billing/popup-return — PayPal redirects the popup here after payment.
+ * Captures the order server-side, then renders HTML that closes the popup window.
+ */
+router.get('/popup-return', async (req: Request, res: Response) => {
+  const token = req.query.token as string;
+  const type = req.query.type as string;
+  let message = 'Payment processed!';
+
+  if (token) {
+    try {
+      const capture = await captureOrder(token);
+      const customId = capture.purchase_units?.[0]?.payments?.captures?.[0]?.custom_id
+        || capture.purchase_units?.[0]?.custom_id;
+      if (customId) await processOneTimePayment(customId);
+      message = type === 'watermark'
+        ? 'Watermark credit added! You can close this window and download your image.'
+        : 'Payment successful!';
+    } catch (err: any) {
+      message = 'Payment was received. You can close this window.';
+    }
+  }
+
+  res.send(`<!DOCTYPE html>
+<html><head><title>PackShot Payment</title>
+<style>body{font-family:system-ui;background:#0a0b0d;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.box{text-align:center;padding:40px;border-radius:16px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.02);max-width:400px}
+.check{font-size:48px;margin-bottom:16px}
+.msg{font-size:16px;margin-bottom:24px;color:#ccc}
+.close{background:#f97316;color:#fff;border:none;padding:12px 32px;border-radius:12px;font-size:14px;font-weight:bold;cursor:pointer;text-transform:uppercase;letter-spacing:2px}
+.close:hover{background:#ea580c}
+.auto{font-size:11px;color:#666;margin-top:16px}</style></head>
+<body><div class="box">
+<div class="check">✓</div>
+<div class="msg">${message}</div>
+<button class="close" onclick="window.close()">Close Window</button>
+<div class="auto">This window will close automatically...</div>
+</div>
+<script>setTimeout(()=>window.close(),3000)</script>
+</body></html>`);
 });
 
 /**

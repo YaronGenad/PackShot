@@ -2,8 +2,8 @@
  * Account dashboard — usage stats, AI credits, subscription management.
  */
 
-import React from 'react';
-import { BarChart3, Coins, Crown, Calendar, CreditCard, Key, Zap, ArrowLeft } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { BarChart3, Coins, Crown, Calendar, CreditCard, Key, Zap, ArrowLeft, Loader2, XCircle, Receipt, Gift } from 'lucide-react';
 import { motion } from 'motion/react';
 import { useAuth } from '../lib/auth-context';
 
@@ -21,7 +21,49 @@ interface AccountDashboardProps {
 }
 
 export const AccountDashboard: React.FC<AccountDashboardProps> = ({ onBack, onOpenPricing, onOpenBYOK, onOpenRewards }) => {
-  const { user, usage, subscription, aiCredits, openBillingPortal, buyCredits } = useAuth();
+  const { user, usage, subscription, aiCredits, openBillingPortal, buyCredits, refreshUser } = useAuth();
+  const [cancelLoading, setCancelLoading] = useState(false);
+  const [cancelMessage, setCancelMessage] = useState<string | null>(null);
+  const [showCreditPacks, setShowCreditPacks] = useState(false);
+  const [creditLoading, setCreditLoading] = useState(false);
+  const [transactions, setTransactions] = useState<any[]>([]);
+  const [rewardsBalance, setRewardsBalance] = useState<{ watermark: number; ai: number }>({ watermark: 0, ai: 0 });
+
+  useEffect(() => {
+    if (!user) return;
+    // Fetch transaction history (reward claims = purchases + rewards)
+    fetch('/api/rewards/active-claims', { credentials: 'include' })
+      .then(r => r.ok ? r.json() : { claims: [] })
+      .then(d => setTransactions(d.claims || []))
+      .catch(() => {});
+    // Fetch reward balances
+    fetch('/api/rewards/status', { credentials: 'include' })
+      .then(r => r.ok ? r.json() : {})
+      .then(d => setRewardsBalance({ watermark: d.watermarkExports || 0, ai: d.bonusAICredits || 0 }))
+      .catch(() => {});
+  }, [user]);
+
+  const cancelSubscription = async () => {
+    if (!confirm('Are you sure you want to cancel your subscription?\nYour benefits continue until the end of the current billing period.')) return;
+    setCancelLoading(true);
+    try {
+      const res = await fetch('/api/billing/cancel', { method: 'POST', credentials: 'include' });
+      if (res.ok) {
+        await refreshUser();
+        setCancelMessage('Subscription cancelled. Your access continues until the end of the billing period.');
+      }
+    } catch { /* silent */ }
+    setCancelLoading(false);
+  };
+
+  const handleBuyCredits = async (pack: '50' | '120' | '300') => {
+    setCreditLoading(true);
+    try {
+      await buyCredits(pack);
+    } finally {
+      setCreditLoading(false);
+    }
+  };
 
   if (!user) {
     return (
@@ -159,19 +201,36 @@ export const AccountDashboard: React.FC<AccountDashboardProps> = ({ onBack, onOp
                   </span>
                 </div>
               )}
-              <div className="flex gap-2">
-                <button
-                  onClick={() => buyCredits('120')}
-                  className="flex-1 px-3 py-2 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 rounded-lg text-[10px] font-mono uppercase tracking-widest transition-colors"
-                >
-                  Buy Credits
-                </button>
-                <button
-                  onClick={onOpenBYOK}
-                  className="flex-1 px-3 py-2 bg-white/5 hover:bg-white/10 text-gray-400 rounded-lg text-[10px] font-mono uppercase tracking-widest transition-colors"
-                >
-                  Manage Keys
-                </button>
+              <div className="space-y-2">
+                {showCreditPacks ? (
+                  <div className="grid grid-cols-3 gap-2">
+                    {([['50', '$5'], ['120', '$10'], ['300', '$20']] as const).map(([pack, price]) => (
+                      <button
+                        key={pack}
+                        onClick={() => handleBuyCredits(pack as '50' | '120' | '300')}
+                        disabled={creditLoading}
+                        className="px-2 py-2 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 rounded-lg text-[10px] font-mono uppercase tracking-widest transition-colors flex flex-col items-center"
+                      >
+                        {creditLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <><span className="font-bold">{pack}</span><span className="text-[8px] text-gray-500">{price}</span></>}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setShowCreditPacks(true)}
+                      className="flex-1 px-3 py-2 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 rounded-lg text-[10px] font-mono uppercase tracking-widest transition-colors"
+                    >
+                      Buy Credits
+                    </button>
+                    <button
+                      onClick={onOpenBYOK}
+                      className="flex-1 px-3 py-2 bg-white/5 hover:bg-white/10 text-gray-400 rounded-lg text-[10px] font-mono uppercase tracking-widest transition-colors"
+                    >
+                      Manage Keys
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -211,13 +270,28 @@ export const AccountDashboard: React.FC<AccountDashboardProps> = ({ onBack, onOp
                   Cancels at period end
                 </p>
               )}
-              <button
-                onClick={openBillingPortal}
-                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 text-gray-300 rounded-xl transition-colors text-xs font-mono uppercase tracking-widest"
-              >
-                <CreditCard className="w-3.5 h-3.5" />
-                Manage Subscription
-              </button>
+              {cancelMessage && (
+                <p className="text-[10px] text-green-400 font-mono bg-green-500/5 p-2 rounded-lg">{cancelMessage}</p>
+              )}
+              <div className="flex gap-2">
+                <button
+                  onClick={openBillingPortal}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-white/5 hover:bg-white/10 text-gray-300 rounded-xl transition-colors text-xs font-mono uppercase tracking-widest"
+                >
+                  <CreditCard className="w-3.5 h-3.5" />
+                  Manage
+                </button>
+                {!subscription.cancel_at_period_end && (
+                  <button
+                    onClick={cancelSubscription}
+                    disabled={cancelLoading}
+                    className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-red-500/5 hover:bg-red-500/10 text-red-400 rounded-xl transition-colors text-xs font-mono uppercase tracking-widest"
+                  >
+                    {cancelLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <XCircle className="w-3.5 h-3.5" />}
+                    Cancel
+                  </button>
+                )}
+              </div>
             </div>
           ) : (
             <div className="space-y-3">
@@ -259,6 +333,96 @@ export const AccountDashboard: React.FC<AccountDashboardProps> = ({ onBack, onOp
             </p>
           </motion.div>
         )}
+
+        {/* Credits & Balances */}
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.2 }}
+          className="p-6 bg-white/[0.02] border border-white/5 rounded-2xl space-y-4 md:col-span-2"
+        >
+          <div className="flex items-center gap-3">
+            <Gift className="w-5 h-5 text-green-500" />
+            <h3 className="text-sm font-bold text-white uppercase tracking-widest">Credits & Balances</h3>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="p-3 bg-white/5 rounded-xl text-center">
+              <p className="text-2xl font-bold text-orange-400">{rewardsBalance.watermark}</p>
+              <p className="text-[9px] font-mono text-gray-500 uppercase">Watermark-free exports</p>
+            </div>
+            <div className="p-3 bg-white/5 rounded-xl text-center">
+              <p className="text-2xl font-bold text-purple-400">{rewardsBalance.ai}</p>
+              <p className="text-[9px] font-mono text-gray-500 uppercase">Bonus AI images</p>
+            </div>
+          </div>
+
+          {onOpenRewards && (
+            <button
+              onClick={onOpenRewards}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 text-gray-300 rounded-xl transition-colors text-xs font-mono uppercase tracking-widest"
+            >
+              Earn free credits →
+            </button>
+          )}
+        </motion.div>
+
+        {/* Transaction History */}
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.25 }}
+          className="p-6 bg-white/[0.02] border border-white/5 rounded-2xl space-y-4 md:col-span-2"
+        >
+          <div className="flex items-center gap-3">
+            <Receipt className="w-5 h-5 text-orange-500" />
+            <h3 className="text-sm font-bold text-white uppercase tracking-widest">Transaction History</h3>
+          </div>
+
+          {transactions.length === 0 ? (
+            <p className="text-sm text-gray-500">No transactions yet.</p>
+          ) : (
+            <div className="space-y-1">
+              {transactions.map((t: any) => (
+                <div key={t.id} className="flex items-center justify-between py-2.5 border-b border-white/5 last:border-0">
+                  <div className="flex flex-col">
+                    <span className="text-sm text-white">
+                      {t.source === 'purchase_watermark' ? 'Watermark Removal' :
+                       t.source === 'share_facebook' ? 'Facebook Share Reward' :
+                       t.source === 'share_linkedin' ? 'LinkedIn Share Reward' :
+                       t.source === 'share_twitter' ? 'X/Twitter Share Reward' :
+                       t.source === 'referral_free' ? 'Free Referral Reward' :
+                       t.source === 'referral_paid' ? 'Paid Referral Reward' :
+                       t.source === 'milestone_10_paid' ? 'Milestone: 10 Paid Referrals' :
+                       t.source}
+                    </span>
+                    <span className="text-[10px] text-gray-600 font-mono">
+                      {new Date(t.claimed_at).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}
+                      {t.expires_at && ` · expires ${new Date(t.expires_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3 text-xs font-mono">
+                    {t.watermark_exports_granted > 0 && (
+                      <div className="flex flex-col items-end">
+                        <span className="text-orange-400">
+                          {t.watermark_exports_remaining}/{t.watermark_exports_granted} exports
+                        </span>
+                        {t.source === 'purchase_watermark' && (
+                          <span className="text-[8px] text-gray-600">$1.00</span>
+                        )}
+                      </div>
+                    )}
+                    {t.ai_credits_granted > 0 && (
+                      <span className="text-purple-400">
+                        {t.ai_credits_remaining}/{t.ai_credits_granted} AI
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </motion.div>
       </div>
     </div>
   );

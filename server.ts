@@ -434,15 +434,15 @@ async function startServer() {
           break;
       }
 
-      // Apply watermark for Free tier users — but first check for consumable credits
-      // (earned via shares, referrals, or purchased for $1). Consumption is atomic via Postgres RPC.
+      // Apply watermark for Free tier users — only consume credit if user explicitly opted in
       const tier = getEffectiveTier(req);
+      const userWantsCredit = req.body.useWatermarkCredit === true;
       let shouldWatermark = TIER_LIMITS[tier].watermark && format !== 'psd';
-      if (shouldWatermark && req.user) {
+      if (shouldWatermark && req.user && userWantsCredit) {
         const consumed = await consumeWatermarkExport(req.user.id);
         if (consumed) {
           shouldWatermark = false;
-          log.info({ userId: req.user.id }, 'Watermark credit consumed');
+          log.info({ userId: req.user.id }, 'Watermark credit consumed (user opted in)');
         }
       }
       if (shouldWatermark) {

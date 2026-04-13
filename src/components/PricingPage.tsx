@@ -3,9 +3,10 @@
  */
 
 import React, { useState } from 'react';
-import { Check, X, Crown, Zap, Camera, Sparkles } from 'lucide-react';
+import { Check, X, Crown, Zap, Camera, Sparkles, Loader2 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { useAuth } from '../lib/auth-context';
+import { AuthModal } from './AuthModal';
 
 const TIERS = [
   {
@@ -81,11 +82,19 @@ interface PricingPageProps {
 export const PricingPage: React.FC<PricingPageProps> = ({ onBack }) => {
   const { user, createCheckout } = useAuth();
   const [interval, setInterval] = useState<'month' | 'year'>('month');
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [billingLoading, setBillingLoading] = useState(false);
   const currentTier = user?.tier || 'free';
 
-  const handleCTA = (tierId: string) => {
+  const handleCTA = async (tierId: string) => {
     if (tierId === 'free' || tierId === currentTier) return;
-    createCheckout(tierId as 'pro' | 'studio', interval);
+    if (!user) { setShowAuthModal(true); return; }
+    setBillingLoading(true);
+    try {
+      await createCheckout(tierId as 'pro' | 'studio', interval);
+    } finally {
+      setBillingLoading(false);
+    }
   };
 
   return (
@@ -206,8 +215,8 @@ export const PricingPage: React.FC<PricingPageProps> = ({ onBack }) => {
               {/* CTA */}
               <button
                 onClick={() => handleCTA(tier.id)}
-                disabled={isCurrentTier || tier.id === 'free'}
-                className={`w-full py-4 rounded-xl font-bold uppercase tracking-widest text-xs transition-all active:scale-95 ${
+                disabled={isCurrentTier || tier.id === 'free' || billingLoading}
+                className={`w-full py-4 rounded-xl font-bold uppercase tracking-widest text-xs transition-all active:scale-95 flex items-center justify-center gap-2 ${
                   isCurrentTier
                     ? 'bg-white/5 text-gray-500 cursor-default'
                     : tier.accent === 'orange'
@@ -215,8 +224,9 @@ export const PricingPage: React.FC<PricingPageProps> = ({ onBack }) => {
                     : tier.accent === 'purple'
                     ? 'bg-purple-500 hover:bg-purple-600 text-white shadow-lg shadow-purple-500/20'
                     : 'bg-white/5 text-gray-500 cursor-default'
-                }`}
+                } ${billingLoading ? 'opacity-70 cursor-wait' : ''}`}
               >
+                {billingLoading && !isCurrentTier && tier.id !== 'free' && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
                 {isCurrentTier ? 'Current Plan' : tier.cta}
               </button>
             </motion.div>
@@ -233,6 +243,8 @@ export const PricingPage: React.FC<PricingPageProps> = ({ onBack }) => {
           </span>
         </div>
       </div>
+
+      <AuthModal isOpen={showAuthModal} onClose={() => setShowAuthModal(false)} defaultTab="register" />
     </div>
   );
 };

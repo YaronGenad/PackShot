@@ -65,7 +65,7 @@ interface AuthContextType extends AuthState {
   refreshRewards: () => Promise<void>;
   createCheckout: (tier: 'pro' | 'studio', interval?: 'month' | 'year') => Promise<void>;
   buyCredits: (pack: '50' | '120' | '300') => Promise<void>;
-  removeWatermark: () => Promise<void>;
+  removeWatermark: (onComplete?: () => void) => Promise<void>;
   openBillingPortal: () => Promise<void>;
 }
 
@@ -196,39 +196,65 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const createCheckout = async (tier: 'pro' | 'studio', interval: 'month' | 'year' = 'month') => {
-    const res = await fetch('/api/billing/create-checkout', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ tier, interval }),
-    });
-    const data = await res.json();
-    if (data.url) {
-      window.location.href = data.url;
+    try {
+      const res = await fetch('/api/billing/create-checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ tier, interval }),
+      });
+      const data = await res.json();
+      if (!res.ok) { console.error('Checkout error:', data.error); return; }
+      if (data.url) window.location.href = data.url;
+    } catch (err) {
+      console.error('Checkout failed:', err);
     }
   };
 
   const buyCredits = async (pack: '50' | '120' | '300') => {
-    const res = await fetch('/api/billing/buy-credits', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ pack }),
-    });
-    const data = await res.json();
-    if (data.url) {
-      window.location.href = data.url;
+    try {
+      const res = await fetch('/api/billing/buy-credits', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ pack }),
+      });
+      const data = await res.json();
+      if (!res.ok) { console.error('Buy credits error:', data.error); return; }
+      if (data.url) window.location.href = data.url;
+    } catch (err) {
+      console.error('Buy credits failed:', err);
     }
   };
 
-  const removeWatermark = async () => {
-    const res = await fetch('/api/billing/remove-watermark', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-    });
-    const data = await res.json();
-    if (data.url) window.location.href = data.url;
+  const removeWatermark = async (onComplete?: () => void) => {
+    try {
+      const res = await fetch('/api/billing/remove-watermark', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+      });
+      const data = await res.json();
+      if (!res.ok) { console.error('Watermark removal error:', data.error); return; }
+      if (data.url) {
+        // Open PayPal in popup — page stays intact, no navigation
+        const popup = window.open(data.url, 'paypal_watermark', 'width=500,height=700,left=200,top=100');
+        // Poll for popup close — server captures the order via popup-return route
+        const pollTimer = setInterval(() => {
+          if (!popup || popup.closed) {
+            clearInterval(pollTimer);
+            // Popup closed — server already captured via popup-return route.
+            // Wait 1.5s for DB write, then trigger the callback (auto-download)
+            setTimeout(() => {
+              fetchRewards();
+              if (onComplete) onComplete();
+            }, 1500);
+          }
+        }, 500);
+      }
+    } catch (err) {
+      console.error('Watermark removal failed:', err);
+    }
   };
 
   const openBillingPortal = async () => {

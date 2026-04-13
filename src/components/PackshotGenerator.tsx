@@ -81,6 +81,7 @@ const FREE_FORMATS = new Set(['jpeg', 'png']);
 export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, onReset }) => {
   const { user, createCheckout, refreshUser, removeWatermark, rewards, refreshRewards } = useAuth();
   const [showWatermarkOptions, setShowWatermarkOptions] = useState(false);
+  const [useWatermarkCredit, setUseWatermarkCredit] = useState(false);
   const tier = user?.tier || 'free';
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationMethod, setGenerationMethod] = useState<'ai' | 'mathematical' | 'aligned-stack'>('aligned-stack');
@@ -747,12 +748,13 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
   };
 
   /** Send canvas content to server for format conversion and trigger browser download. */
-  const downloadResult = async (format: string = exportFormat) => {
+  const downloadResult = async (format: string = exportFormat, forceUseCredit?: boolean) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
     setIsDownloading(true);
     setShowExportMenu(false);
+    const shouldUseCredit = forceUseCredit !== undefined ? forceUseCredit : useWatermarkCredit;
     try {
       const imageBase64 = canvas.toDataURL('image/png');
 
@@ -760,7 +762,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ imageBase64, format }),
+        body: JSON.stringify({ imageBase64, format, useWatermarkCredit: shouldUseCredit }),
       });
 
       if (!response.ok) {
@@ -1064,10 +1066,19 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                   {/* Watermark status (free tier only) */}
                   {tier === 'free' && (
                     rewards && rewards.watermarkExports > 0 ? (
-                      <div className="mt-1.5 flex items-center justify-center gap-1.5 text-[9px] text-green-400 font-mono uppercase tracking-widest">
-                        <span className="w-1.5 h-1.5 bg-green-400 rounded-full"></span>
-                        {rewards.watermarkExports} watermark-free export{rewards.watermarkExports !== 1 ? 's' : ''} available
-                      </div>
+                      <button
+                        onClick={() => setUseWatermarkCredit(!useWatermarkCredit)}
+                        className={`mt-1.5 flex items-center justify-center gap-2 text-[9px] font-mono uppercase tracking-widest transition-colors ${
+                          useWatermarkCredit ? 'text-green-400' : 'text-gray-500 hover:text-gray-300'
+                        }`}
+                      >
+                        <span className={`w-3 h-3 rounded border flex items-center justify-center transition-colors ${
+                          useWatermarkCredit ? 'bg-green-500 border-green-500' : 'border-gray-600'
+                        }`}>
+                          {useWatermarkCredit && <span className="text-[7px] text-white">✓</span>}
+                        </span>
+                        Use watermark credit ({rewards.watermarkExports} left)
+                      </button>
                     ) : (
                       <button
                         onClick={() => setShowWatermarkOptions(!showWatermarkOptions)}
@@ -1100,7 +1111,17 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                         </div>
 
                         <button
-                          onClick={() => { setShowWatermarkOptions(false); if (user) removeWatermark(); else createCheckout('pro'); }}
+                          onClick={() => {
+                            setShowWatermarkOptions(false);
+                            if (user) {
+                              // After PayPal popup payment completes, auto-download without watermark
+                              removeWatermark(() => {
+                                downloadResult(exportFormat, true);
+                              });
+                            } else {
+                              setShowAuthModal(true);
+                            }
+                          }}
                           className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-white/5 transition-colors border-b border-white/5"
                         >
                           <div className="flex flex-col">
