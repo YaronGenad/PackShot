@@ -6,6 +6,7 @@
 import React, { useState, useRef } from 'react';
 import { Upload, FileCode, X, CheckCircle2, Loader2, AlertTriangle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { useAuth } from '../lib/auth-context';
 
 interface ProcessedImage {
   name: string;
@@ -24,7 +25,12 @@ const MAX_FILE_SIZE_MB = 100;
 /** Check if file has a supported RAW/PSD extension. */
 const isSupported = (name: string) => RAW_EXTENSIONS.some(ext => name.toLowerCase().endsWith(ext));
 
+const TIER_FILE_LIMITS = { free: 10, pro: 20, studio: 50 };
+
 export const RawUploader: React.FC<RawUploaderProps> = ({ onImagesProcessed }) => {
+  const { user } = useAuth();
+  const tier = (user?.tier || 'free') as keyof typeof TIER_FILE_LIMITS;
+  const maxFiles = TIER_FILE_LIMITS[tier];
   const [isUploading, setIsUploading] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
   const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number; fileName: string } | null>(null);
@@ -49,7 +55,14 @@ export const RawUploader: React.FC<RawUploaderProps> = ({ onImagesProcessed }) =
     }
 
     if (accepted.length > 0) {
-      setFiles(prev => [...prev, ...accepted]);
+      setFiles(prev => {
+        const combined = [...prev, ...accepted];
+        if (combined.length > maxFiles) {
+          setWarning(`File limit: ${maxFiles} files for ${tier} tier. Extra files removed.`);
+          return combined.slice(0, maxFiles);
+        }
+        return combined;
+      });
     }
 
     const warnings: string[] = [];
@@ -227,7 +240,9 @@ export const RawUploader: React.FC<RawUploaderProps> = ({ onImagesProcessed }) =
             <div className="p-4 border-bottom border-white/5 bg-white/5 flex items-center justify-between">
               <div className="flex items-center space-x-2">
                 <FileCode className="w-4 h-4 text-orange-500" />
-                <span className="text-xs font-mono uppercase tracking-widest text-gray-400">Queue: {files.length} Files</span>
+                <span className={`text-xs font-mono uppercase tracking-widest ${files.length >= maxFiles ? 'text-red-400' : 'text-gray-400'}`}>
+                  Queue: {files.length}/{maxFiles} Files
+                </span>
               </div>
               <button
                 onClick={() => setFiles([])}

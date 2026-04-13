@@ -4,31 +4,34 @@
  */
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Sparkles, Loader2, Download, RefreshCw, Layers, Camera, Image as ImageIcon, Sun, Palette, Zap, Target, SlidersHorizontal, Wand2, MessageSquare, Send, Crop, Check, X } from 'lucide-react';
+import { Sparkles, Loader2, Download, RefreshCw, Layers, Camera, Image as ImageIcon, Sun, Palette, Zap, Target, SlidersHorizontal, Wand2, MessageSquare, Send, Crop, Check, X, Crown } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-// Gemini AI functions — proxied through server to keep API key server-side only
-const generatePackshot = async (images: { base64: string; mimeType: string }[]): Promise<string> => {
+import { useAuth } from '../lib/auth-context';
+import { AICreditsPanel } from './AICreditsPanel';
+import { AuthModal } from './AuthModal';
+// AI functions — proxied through server, supports multi-provider via `provider` field
+const generatePackshot = async (images: { base64: string; mimeType: string }[], provider?: string): Promise<string> => {
   const res = await fetch('/api/generate-packshot', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ images }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+    body: JSON.stringify({ images, provider }),
   });
   if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Generation failed'); }
   return (await res.json()).image;
 };
 
-const homogenizePackshot = async (currentImage: string, sourceImages: { base64: string; mimeType: string }[], burnt: number, dark: number): Promise<string> => {
+const homogenizePackshot = async (currentImage: string, sourceImages: { base64: string; mimeType: string }[], burnt: number, dark: number, provider?: string): Promise<string> => {
   const res = await fetch('/api/homogenize', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ currentImage, sourceImages, burnt, dark }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+    body: JSON.stringify({ currentImage, sourceImages, burnt, dark, provider }),
   });
   if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Homogenization failed'); }
   return (await res.json()).image;
 };
 
-const editPackshot = async (currentImage: string, sourceImages: { base64: string; mimeType: string }[], prompt: string): Promise<string> => {
+const editPackshot = async (currentImage: string, sourceImages: { base64: string; mimeType: string }[], prompt: string, provider?: string): Promise<string> => {
   const res = await fetch('/api/edit-packshot', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ currentImage, sourceImages, prompt }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+    body: JSON.stringify({ currentImage, sourceImages, prompt, provider }),
   });
   if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Edit failed'); }
   return (await res.json()).image;
@@ -72,9 +75,15 @@ const DEFAULT_ADJUSTMENTS: Adjustments = {
   sharpen: 0
 };
 
+/** Formats available only on Pro/Studio tiers. */
+const FREE_FORMATS = new Set(['jpeg', 'png']);
+
 export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, onReset }) => {
+  const { user, createCheckout, refreshUser, removeWatermark, rewards, refreshRewards } = useAuth();
+  const [showWatermarkOptions, setShowWatermarkOptions] = useState(false);
+  const tier = user?.tier || 'free';
   const [isGenerating, setIsGenerating] = useState(false);
-  const [generationMethod, setGenerationMethod] = useState<'ai' | 'mathematical' | 'aligned-stack'>('ai');
+  const [generationMethod, setGenerationMethod] = useState<'ai' | 'mathematical' | 'aligned-stack'>('aligned-stack');
   const [isHomogenizing, setIsHomogenizing] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
@@ -84,16 +93,25 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
   const [resultImage, setResultImage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [adjustments, setAdjustments] = useState<Adjustments>(DEFAULT_ADJUSTMENTS);
-  const [exportFormat, setExportFormat] = useState<string>('tiff');
+  // Free tier defaults to JPEG (only JPEG/PNG allowed); Pro/Studio default to TIFF (print quality)
+  const [exportFormat, setExportFormat] = useState<string>(tier === 'free' ? 'jpeg' : 'tiff');
   const [showExportMenu, setShowExportMenu] = useState(false);
 
+  // Reset default format when tier changes (e.g. after login)
+  useEffect(() => {
+    setExportFormat(tier === 'free' ? 'jpeg' : 'tiff');
+  }, [tier]);
+
+  const [showAuthModal, setShowAuthModal] = useState(false);
   const [isCropping, setIsCropping] = useState(false);
   const [cropRect, setCropRect] = useState<CropRect | null>(null);
+  const [aiProvider, setAiProvider] = useState<string | undefined>(undefined); // user's preferred provider
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cropOverlayRef = useRef<HTMLCanvasElement>(null);
   const originalImageRef = useRef<HTMLImageElement | null>(null);
   const dragStateRef = useRef<{ type: string; startX: number; startY: number; startRect: CropRect } | null>(null);
+  const [imageLoadCounter, setImageLoadCounter] = useState(0); // bump to trigger canvas redraw after image loads
 
   // Reset state when source images change to prevent caching old results
   useEffect(() => {
@@ -111,21 +129,28 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
 
   /** Dispatch to selected generation method: AI, aligned stack, or quick stack. */
   const handleGenerate = async () => {
+    // Anonymous users must sign in before generating — we can't track their usage otherwise
+    if (!user) {
+      setShowAuthModal(true);
+      return;
+    }
+
     if (generationMethod === 'ai') {
       setIsGenerating(true);
       setError(null);
       setAdjustments(DEFAULT_ADJUSTMENTS);
       try {
-        const result = await generatePackshot(images);
+        const result = await generatePackshot(images, aiProvider);
         setResultImage(result);
-        
+        refreshUser(); // Refresh usage counter after successful generation
+
         // Pre-load image for canvas processing
         const img = new Image();
         img.crossOrigin = "anonymous";
         img.src = result;
         img.onload = () => {
           originalImageRef.current = img;
-          applyAdjustments();
+          setImageLoadCounter(c => c + 1);
         };
       } catch (err: any) {
         console.error('Generation error:', err);
@@ -241,12 +266,13 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       ctx.putImageData(resultData, 0, 0);
       const result = canvas.toDataURL('image/png');
       setResultImage(result);
-      
+      refreshUser(); // Refresh usage counter after successful stack
+
       const img = new Image();
       img.src = result;
       img.onload = () => {
         originalImageRef.current = img;
-        applyAdjustments();
+        setImageLoadCounter(c => c + 1);
       };
     } catch (err) {
       console.error('Mathematical stacking error:', err);
@@ -284,6 +310,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       const data = await response.json();
       const resultDataUrl = `data:${data.result.mimeType};base64,${data.result.base64}`;
       setResultImage(resultDataUrl);
+      refreshUser(); // Refresh usage counter after successful stack
 
       // Log diagnostics
       console.log('[aligned-stack] Diagnostics:', data.diagnostics);
@@ -292,7 +319,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       img.src = resultDataUrl;
       img.onload = () => {
         originalImageRef.current = img;
-        applyAdjustments();
+        setImageLoadCounter(c => c + 1);
       };
     } catch (err: any) {
       console.error('Aligned stacking error:', err);
@@ -309,7 +336,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     setError(null);
     setShowHomogenizeOptions(false);
     try {
-      const result = await homogenizePackshot(resultImage, images, homogenizeSettings.burnt, homogenizeSettings.dark);
+      const result = await homogenizePackshot(resultImage, images, homogenizeSettings.burnt, homogenizeSettings.dark, aiProvider);
       setResultImage(result);
       
       const img = new Image();
@@ -317,7 +344,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       img.src = result;
       img.onload = () => {
         originalImageRef.current = img;
-        applyAdjustments();
+        setImageLoadCounter(c => c + 1);
       };
     } catch (err: any) {
       console.error('Homogenization error:', err);
@@ -333,7 +360,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     setIsEditing(true);
     setError(null);
     try {
-      const result = await editPackshot(resultImage, images, editPrompt);
+      const result = await editPackshot(resultImage, images, editPrompt, aiProvider);
       setResultImage(result);
       setEditPrompt('');
       
@@ -342,7 +369,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       img.src = result;
       img.onload = () => {
         originalImageRef.current = img;
-        applyAdjustments();
+        setImageLoadCounter(c => c + 1);
       };
     } catch (err: any) {
       console.error('Edit error:', err);
@@ -458,16 +485,30 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
   };
 
   useEffect(() => {
-    if (resultImage && originalImageRef.current) {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      rafRef.current = requestAnimationFrame(() => {
+    // Skip while loading state is active — canvas is not yet mounted (AnimatePresence shows spinner)
+    if (isGenerating || isHomogenizing || isEditing) return;
+    if (!resultImage || !originalImageRef.current) return;
+
+    // Poll for canvas mount (AnimatePresence mode="wait" delays mounting until exit animation completes)
+    let cancelled = false;
+    let attempts = 0;
+    const tryDraw = () => {
+      if (cancelled) return;
+      if (canvasRef.current) {
         applyAdjustments();
-      });
-    }
+      } else if (attempts < 60) { // retry for up to ~1 second
+        attempts++;
+        rafRef.current = requestAnimationFrame(tryDraw);
+      }
+    };
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(tryDraw);
+
     return () => {
+      cancelled = true;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [adjustments, resultImage]);
+  }, [adjustments, resultImage, imageLoadCounter, isGenerating, isHomogenizing, isEditing]);
 
   // ── Crop Functions ──────────────────────────────────────────────────────
 
@@ -552,7 +593,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       setResultImage(dataUrl);
       setIsCropping(false);
       setCropRect(null);
-      applyAdjustments();
+      setImageLoadCounter(c => c + 1);
     };
   };
 
@@ -627,19 +668,24 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
     if (!cropRect) return '';
     const tl = imageToCSS(cropRect.x, cropRect.y);
     const br = imageToCSS(cropRect.x + cropRect.w, cropRect.y + cropRect.h);
-    const tolerance = 12;
-    const onLeft = Math.abs(cssX - tl.x) < tolerance;
-    const onRight = Math.abs(cssX - br.x) < tolerance;
-    const onTop = Math.abs(cssY - tl.y) < tolerance;
-    const onBottom = Math.abs(cssY - br.y) < tolerance;
+    const tolerance = 16; // wider hitbox so edges feel snappy
+    // Asymmetric: extend hit range slightly past the visible border so it works
+    // even when cursor overshoots bottom/right edges
+    const onLeft = cssX >= tl.x - tolerance && cssX <= tl.x + tolerance;
+    const onRight = cssX >= br.x - tolerance && cssX <= br.x + tolerance;
+    const onTop = cssY >= tl.y - tolerance && cssY <= tl.y + tolerance;
+    const onBottom = cssY >= br.y - tolerance && cssY <= br.y + tolerance;
+    // Corners first (they take priority over edges)
     if (onTop && onLeft) return 'tl';
     if (onTop && onRight) return 'tr';
     if (onBottom && onLeft) return 'bl';
     if (onBottom && onRight) return 'br';
-    if (onTop) return 't';
-    if (onBottom) return 'b';
-    if (onLeft) return 'l';
-    if (onRight) return 'r';
+    // Edges — must also be within the perpendicular range
+    if (onTop && cssX >= tl.x && cssX <= br.x) return 't';
+    if (onBottom && cssX >= tl.x && cssX <= br.x) return 'b';
+    if (onLeft && cssY >= tl.y && cssY <= br.y) return 'l';
+    if (onRight && cssY >= tl.y && cssY <= br.y) return 'r';
+    // Inside — move
     if (cssX > tl.x && cssX < br.x && cssY > tl.y && cssY < br.y) return 'move';
     return '';
   };
@@ -713,11 +759,21 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       const response = await fetch('/api/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ imageBase64, format }),
       });
 
       if (!response.ok) {
-        throw new Error(`Failed to export as ${format.toUpperCase()}`);
+        const errData = await response.json().catch(() => null);
+        if (response.status === 403 && errData?.code === 'FORMAT_RESTRICTED') {
+          setError(`${format.toUpperCase()} requires Pro. Free tier supports JPEG and PNG. Sign up for Pro to unlock all formats.`);
+          return;
+        }
+        if (response.status === 402) {
+          setError(errData?.error || 'Monthly limit reached. Sign up or upgrade for more.');
+          return;
+        }
+        throw new Error(errData?.error || `Failed to export as ${format.toUpperCase()}`);
       }
 
       const blob = await response.blob();
@@ -730,6 +786,8 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       link.click();
       document.body.removeChild(link);
       window.URL.revokeObjectURL(url);
+      // Refresh rewards to reflect consumed watermark credit (if any)
+      if (tier === 'free' && user) refreshRewards();
     } catch (err) {
       console.error('Download error:', err);
       setError(`Failed to download as ${format.toUpperCase()}. Please try again.`);
@@ -759,10 +817,12 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
             </div>
             <button
               onClick={onReset}
-              className="p-2 hover:bg-white/5 rounded-lg text-gray-500 hover:text-white transition-all"
-              aria-label="Reset and upload new files"
+              className="flex items-center gap-2 px-3 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-gray-400 hover:text-white transition-all text-[10px] font-mono uppercase tracking-widest"
+              aria-label="Start new — upload different files"
+              title="Start new packshot"
             >
-              <RefreshCw className="w-5 h-5" />
+              <RefreshCw className="w-4 h-4" />
+              <span>Start New</span>
             </button>
           </div>
 
@@ -787,29 +847,58 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
 
           {!resultImage && (
             <div className="space-y-4 pt-4">
-              <div className="flex bg-white/5 p-1 rounded-xl border border-white/10">
+              <div className="grid grid-cols-3 gap-2 bg-white/5 p-1.5 rounded-2xl border border-white/10">
                 <button
-                  onClick={() => setGenerationMethod('ai')}
-                  className={`flex-1 flex items-center justify-center space-x-2 py-2.5 rounded-lg transition-all ${generationMethod === 'ai' ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/20' : 'text-gray-500 hover:text-white'}`}
+                  onClick={() => setGenerationMethod('mathematical')}
+                  className={`flex flex-col items-center justify-center gap-1.5 py-4 px-2 rounded-xl transition-all ${generationMethod === 'mathematical' ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/20' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
                 >
-                  <Sparkles className="w-4 h-4" />
-                  <span className="text-[10px] font-bold uppercase tracking-widest">AI Synthesis</span>
+                  <Layers className="w-5 h-5" />
+                  <span className="text-xs font-bold uppercase tracking-wider">Quick</span>
                 </button>
                 <button
                   onClick={() => setGenerationMethod('aligned-stack')}
-                  className={`flex-1 flex items-center justify-center space-x-2 py-2.5 rounded-lg transition-all ${generationMethod === 'aligned-stack' ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/20' : 'text-gray-500 hover:text-white'}`}
+                  className={`flex flex-col items-center justify-center gap-1.5 py-4 px-2 rounded-xl transition-all ${generationMethod === 'aligned-stack' ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/20' : 'text-gray-400 hover:text-white hover:bg-white/5'}`}
                 >
-                  <Target className="w-4 h-4" />
-                  <span className="text-[10px] font-bold uppercase tracking-widest">Aligned Stack</span>
+                  <Target className="w-5 h-5" />
+                  <span className="text-xs font-bold uppercase tracking-wider">Aligned</span>
                 </button>
                 <button
-                  onClick={() => setGenerationMethod('mathematical')}
-                  className={`flex-1 flex items-center justify-center space-x-2 py-2.5 rounded-lg transition-all ${generationMethod === 'mathematical' ? 'bg-orange-500 text-white shadow-lg shadow-orange-500/20' : 'text-gray-500 hover:text-white'}`}
+                  onClick={() => setGenerationMethod('ai')}
+                  className={`flex flex-col items-center justify-center gap-1.5 py-4 px-2 rounded-xl transition-all relative ${
+                    generationMethod === 'ai'
+                      ? (tier === 'free' ? 'bg-gray-700 text-gray-400' : 'bg-orange-500 text-white shadow-lg shadow-orange-500/20')
+                      : (tier === 'free' ? 'text-gray-600 hover:text-gray-400 hover:bg-white/5' : 'text-gray-400 hover:text-white hover:bg-white/5')
+                  }`}
                 >
-                  <Layers className="w-4 h-4" />
-                  <span className="text-[10px] font-bold uppercase tracking-widest">Quick Stack</span>
+                  <Sparkles className="w-5 h-5" />
+                  <span className="text-xs font-bold uppercase tracking-wider">AI</span>
+                  {tier === 'free' && (
+                    <Crown className="w-3 h-3 absolute top-1.5 right-1.5 text-orange-500/70" />
+                  )}
                 </button>
               </div>
+
+              {generationMethod === 'ai' && (
+                <div className="space-y-3">
+                  <AICreditsPanel />
+                  {/* Provider selector */}
+                  {tier !== 'free' && (
+                    <div className="flex items-center gap-2 px-3 py-2 bg-white/5 border border-white/10 rounded-xl">
+                      <span className="text-[9px] font-mono uppercase tracking-widest text-gray-500 shrink-0">Provider:</span>
+                      <select
+                        value={aiProvider || ''}
+                        onChange={(e) => setAiProvider(e.target.value || undefined)}
+                        className="flex-1 bg-transparent text-xs text-white font-mono uppercase tracking-widest border-none outline-none cursor-pointer appearance-none"
+                      >
+                        <option value="" className="bg-[#1a1b1f]">Auto (best available)</option>
+                        <option value="gemini" className="bg-[#1a1b1f]">Google Gemini</option>
+                        <option value="openai" className="bg-[#1a1b1f]">OpenAI</option>
+                        <option value="grok" className="bg-[#1a1b1f]">xAI Grok</option>
+                      </select>
+                    </div>
+                  )}
+                </div>
+              )}
 
               <button
                 onClick={handleGenerate}
@@ -831,7 +920,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
               
               <p className="text-[9px] text-gray-500 font-mono uppercase tracking-[0.15em] text-center px-4 leading-relaxed">
                 {generationMethod === 'ai'
-                  ? 'Uses Gemini 3.1 Flash to synthesize a perfect studio packshot with pure white background.'
+                  ? `Uses ${aiProvider === 'openai' ? 'OpenAI GPT-4o' : aiProvider === 'grok' ? 'xAI Grok' : 'Gemini 3.1 Flash'} to synthesize a perfect studio packshot with pure white background.`
                   : generationMethod === 'aligned-stack'
                   ? 'Server-side OpenCV alignment + multi-scale focus stacking. Corrects camera vibration, no LLM involved.'
                   : 'Client-side quick stacking: Combines sharpest parts without alignment. Fast but may show ghosting.'}
@@ -850,7 +939,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
               <div>
                 <h3 className="text-lg font-bold text-white uppercase tracking-tight">Final Output</h3>
                 <p className="text-[10px] text-gray-500 font-mono uppercase tracking-widest">
-                  {generationMethod === 'ai' ? 'AI Generated Studio Quality' : generationMethod === 'aligned-stack' ? 'Aligned Focus Stack (OpenCV)' : 'Quick Focus Stack'}
+                  {generationMethod === 'ai' ? 'AI Generated Studio Quality' : generationMethod === 'aligned-stack' ? 'Aligned Focus Stack · Non-AI' : 'Quick Focus Stack · Non-AI'}
                 </p>
               </div>
             </div>
@@ -948,7 +1037,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                   </>
                 )}
 
-                <div className="relative">
+                <div className="relative flex flex-col items-stretch">
                   <div className="flex">
                     <button
                       onClick={() => downloadResult()}
@@ -972,6 +1061,82 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                     </button>
                   </div>
 
+                  {/* Watermark status (free tier only) */}
+                  {tier === 'free' && (
+                    rewards && rewards.watermarkExports > 0 ? (
+                      <div className="mt-1.5 flex items-center justify-center gap-1.5 text-[9px] text-green-400 font-mono uppercase tracking-widest">
+                        <span className="w-1.5 h-1.5 bg-green-400 rounded-full"></span>
+                        {rewards.watermarkExports} watermark-free export{rewards.watermarkExports !== 1 ? 's' : ''} available
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setShowWatermarkOptions(!showWatermarkOptions)}
+                        className="mt-1.5 text-[9px] text-orange-400/70 hover:text-orange-400 font-mono uppercase tracking-widest text-center transition-colors"
+                      >
+                        Download without watermark →
+                      </button>
+                    )
+                  )}
+
+                  {/* Watermark removal popover */}
+                  <AnimatePresence>
+                    {showWatermarkOptions && tier === 'free' && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 6, scale: 0.95 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, y: 6, scale: 0.95 }}
+                        className="absolute top-full left-0 right-0 mt-2 bg-[#1a1b1e] border border-white/10 rounded-xl shadow-2xl z-50 overflow-hidden"
+                      >
+                        <div className="p-3 border-b border-white/5 bg-white/5">
+                          <p className="text-[10px] font-mono uppercase tracking-widest text-gray-400">
+                            Remove Watermark
+                          </p>
+                          <div className="mt-1 flex items-center gap-2">
+                            <div className="px-1.5 py-0.5 bg-black/40 border border-white/10 rounded text-[8px] font-mono text-white/60">
+                              Made with PackShot
+                            </div>
+                            <span className="text-[9px] text-gray-600">diagonal pattern across image</span>
+                          </div>
+                        </div>
+
+                        <button
+                          onClick={() => { setShowWatermarkOptions(false); if (user) removeWatermark(); else createCheckout('pro'); }}
+                          className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-white/5 transition-colors border-b border-white/5"
+                        >
+                          <div className="flex flex-col">
+                            <span className="text-xs font-bold text-white uppercase tracking-widest">One-time removal</span>
+                            <span className="text-[9px] text-gray-500">{user ? 'Next export only' : 'Sign in required'}</span>
+                          </div>
+                          <div className="flex flex-col items-end">
+                            <span className="text-sm font-bold text-green-400">$1</span>
+                            <span className="text-[8px] text-gray-600 line-through font-mono">$2</span>
+                          </div>
+                        </button>
+
+                        <button
+                          onClick={() => { setShowWatermarkOptions(false); createCheckout('pro'); }}
+                          className="w-full flex items-center justify-between px-4 py-3 text-left hover:bg-orange-500/10 transition-colors border-b border-white/5"
+                        >
+                          <div className="flex flex-col">
+                            <span className="text-xs font-bold text-orange-400 uppercase tracking-widest flex items-center gap-1.5">
+                              <Crown className="w-3 h-3" /> Upgrade Pro
+                            </span>
+                            <span className="text-[9px] text-gray-500">Unlimited · all formats · no watermark</span>
+                          </div>
+                          <span className="text-sm font-bold text-orange-400">$19/mo</span>
+                        </button>
+
+                        {user && (
+                          <div className="px-4 py-2.5 bg-white/[0.02]">
+                            <p className="text-[9px] text-gray-500 text-center">
+                              Or <a href="#" onClick={(e) => { e.preventDefault(); setShowWatermarkOptions(false); window.dispatchEvent(new CustomEvent('packshot:navigate', { detail: 'rewards' })); }} className="text-orange-400 hover:underline">earn free credits</a> by sharing and inviting friends
+                            </p>
+                          </div>
+                        )}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
                   <AnimatePresence>
                     {showExportMenu && (
                       <motion.div
@@ -987,16 +1152,28 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                           { id: 'webp', label: 'WebP', desc: 'Quality 95' },
                           { id: 'avif', label: 'AVIF', desc: 'Quality 80' },
                           { id: 'psd', label: 'PSD', desc: 'Photoshop, 1 layer' },
-                        ].map(fmt => (
-                          <button
-                            key={fmt.id}
-                            onClick={() => { setExportFormat(fmt.id); setShowExportMenu(false); }}
-                            className={`w-full flex items-center justify-between px-4 py-2.5 text-left transition-colors ${exportFormat === fmt.id ? 'bg-orange-500/20 text-orange-400' : 'text-gray-300 hover:bg-white/5'}`}
-                          >
-                            <span className="text-xs font-bold uppercase tracking-widest">{fmt.label}</span>
-                            <span className="text-[9px] text-gray-500">{fmt.desc}</span>
-                          </button>
-                        ))}
+                        ].map(fmt => {
+                          const locked = tier === 'free' && !FREE_FORMATS.has(fmt.id);
+                          return (
+                            <button
+                              key={fmt.id}
+                              onClick={() => {
+                                if (locked) { createCheckout('pro'); return; }
+                                setExportFormat(fmt.id); setShowExportMenu(false);
+                              }}
+                              className={`w-full flex items-center justify-between px-4 py-2.5 text-left transition-colors ${
+                                locked ? 'opacity-50 cursor-not-allowed' :
+                                exportFormat === fmt.id ? 'bg-orange-500/20 text-orange-400' : 'text-gray-300 hover:bg-white/5'
+                              }`}
+                            >
+                              <span className="text-xs font-bold uppercase tracking-widest flex items-center gap-2">
+                                {fmt.label}
+                                {locked && <Crown className="w-3 h-3 text-orange-500" />}
+                              </span>
+                              <span className="text-[9px] text-gray-500">{locked ? 'Pro' : fmt.desc}</span>
+                            </button>
+                          );
+                        })}
                       </motion.div>
                     )}
                   </AnimatePresence>
@@ -1023,7 +1200,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                       </div>
                       <div className="space-y-2">
                         <p className="text-white font-medium">
-                          {isHomogenizing ? 'Homogenizing Lighting' : isEditing ? 'Applying Targeted Edits' : generationMethod === 'ai' ? 'Technical Synthesis in Progress' : generationMethod === 'aligned-stack' ? 'Aligned Focus Stacking (OpenCV)' : 'Mathematical Focus Stacking'}
+                          {isHomogenizing ? 'Homogenizing Lighting' : isEditing ? 'Applying Targeted Edits' : generationMethod === 'ai' ? 'Technical Synthesis in Progress' : generationMethod === 'aligned-stack' ? 'Aligned Focus Stacking' : 'Quick Focus Stacking'}
                         </p>
                         <p className="text-xs text-gray-500 max-w-[200px]">
                           {isHomogenizing 
@@ -1033,8 +1210,8 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                             : generationMethod === 'ai'
                             ? 'Enforcing strict packshot standards: Pure white background, zero artistic deviation, and exact product fidelity.'
                             : generationMethod === 'aligned-stack'
-                            ? 'Detecting features, aligning frames, computing multi-scale focus maps, and blending for a sharp, ghost-free result.'
-                            : 'Analyzing local contrast and sharpness across all frames to reconstruct a single high-depth-of-field image.'}
+                            ? 'Non-AI mathematical algorithm: detecting features, aligning frames, computing multi-scale focus maps, and blending for a sharp, ghost-free result.'
+                            : 'Non-AI mathematical algorithm: analyzing local contrast and sharpness across all frames to reconstruct a single high-depth-of-field image.'}
                         </p>
                       </div>
                     </motion.div>
@@ -1073,31 +1250,45 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
 
             {/* Prompt Edit Bar */}
             {resultImage && !isGenerating && !isHomogenizing && !isEditing && (
-              <motion.div 
+              <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="relative group"
               >
                 <div className="absolute inset-0 bg-orange-500/5 blur-xl group-hover:bg-orange-500/10 transition-all rounded-2xl" />
-                <div className="relative flex items-center bg-[#1a1b1e] border border-white/10 rounded-2xl p-2 pl-4 shadow-xl focus-within:border-orange-500/50 transition-all">
+                <div className={`relative flex items-center bg-[#1a1b1e] border border-white/10 rounded-2xl p-2 pl-4 shadow-xl transition-all ${tier === 'free' ? 'opacity-60' : 'focus-within:border-orange-500/50'}`}>
                   <MessageSquare className="w-4 h-4 text-gray-500 mr-3" />
-                  <input 
-                    type="text"
-                    value={editPrompt}
-                    onChange={(e) => setEditPrompt(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && handleEdit()}
-                    placeholder="Describe a specific change (e.g., 'Change cap color to red', 'Remove the label')..."
-                    className="flex-1 bg-transparent border-none focus:ring-0 text-sm text-white placeholder:text-gray-600 py-2"
-                    aria-label="Edit prompt for targeted AI modification"
-                  />
-                  <button
-                    onClick={handleEdit}
-                    disabled={!editPrompt.trim() || isEditing}
-                    className="p-2 bg-orange-500 hover:bg-orange-600 disabled:bg-gray-800 disabled:text-gray-600 text-white rounded-xl transition-all ml-2"
-                    aria-label="Send edit request"
-                  >
-                    <Send className="w-4 h-4" />
-                  </button>
+                  {tier === 'free' ? (
+                    <div className="flex-1 flex items-center justify-between py-2">
+                      <span className="text-sm text-gray-500 font-mono uppercase tracking-widest">AI Edits are for Pro users only</span>
+                      <button
+                        onClick={() => createCheckout('pro')}
+                        className="ml-3 px-3 py-1 bg-orange-500 hover:bg-orange-600 text-white text-[10px] font-bold uppercase tracking-widest rounded-lg transition-all"
+                      >
+                        Upgrade
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <input
+                        type="text"
+                        value={editPrompt}
+                        onChange={(e) => setEditPrompt(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleEdit()}
+                        placeholder="Describe a specific change (e.g., 'Change cap color to red', 'Remove the label')..."
+                        className="flex-1 bg-transparent border-none focus:ring-0 text-sm text-white placeholder:text-gray-600 py-2"
+                        aria-label="Edit prompt for targeted AI modification"
+                      />
+                      <button
+                        onClick={handleEdit}
+                        disabled={!editPrompt.trim() || isEditing}
+                        className="p-2 bg-orange-500 hover:bg-orange-600 disabled:bg-gray-800 disabled:text-gray-600 text-white rounded-xl transition-all ml-2"
+                        aria-label="Send edit request"
+                      >
+                        <Send className="w-4 h-4" />
+                      </button>
+                    </>
+                  )}
                 </div>
                 <p className="mt-2 text-[9px] text-gray-500 font-mono uppercase tracking-widest text-center">
                   Targeted AI Editing • No additional creativity applied
@@ -1184,6 +1375,13 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
           )}
         </div>
       </div>
+
+      {/* Auth modal shown when anonymous user tries to generate */}
+      <AuthModal
+        isOpen={showAuthModal}
+        onClose={() => setShowAuthModal(false)}
+        defaultTab="register"
+      />
     </div>
   );
 };
