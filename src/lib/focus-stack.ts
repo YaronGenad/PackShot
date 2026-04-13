@@ -6,6 +6,9 @@
 
 import cv from '@techstark/opencv-js';
 import sharp from 'sharp';
+import pino from 'pino';
+
+const log = pino({ level: 'info' });
 import type {
   FocusStackImage,
   FocusStackOptions,
@@ -181,7 +184,7 @@ export async function performFocusStack(
     }
   }
   stagesMs.referenceSelection = Date.now() - t;
-  console.log(`[focus-stack] Reference image: #${refIdx} (sharpness: ${maxSharpness.toFixed(2)})`);
+  log.info({ refIdx, sharpness: maxSharpness.toFixed(2) }, 'Reference image selected');
 
   // ── Stage 3: Feature detection ──────────────────────────────────────────
   t = Date.now();
@@ -192,7 +195,7 @@ export async function performFocusStack(
   const refDesc = new cv.Mat();
   const emptyMask = new cv.Mat();
   detector.detectAndCompute(decoded[refIdx].gray, emptyMask, refKp, refDesc);
-  console.log(`[focus-stack] Reference features: ${refKp.size()}`);
+  log.info({ count: refKp.size() }, 'Reference features detected');
 
   // Detect features on all other images
   const otherFeatures: { kp: any; desc: any; idx: number }[] = [];
@@ -202,7 +205,7 @@ export async function performFocusStack(
     const desc = new cv.Mat();
     detector.detectAndCompute(decoded[i].gray, emptyMask, kp, desc);
     otherFeatures.push({ kp, desc, idx: i });
-    console.log(`[focus-stack] Image #${i} features: ${kp.size()}`);
+    log.info({ image: i, count: kp.size() }, 'Image features detected');
   }
   stagesMs.featureDetection = Date.now() - t;
 
@@ -361,7 +364,7 @@ export async function performFocusStack(
     validMasks.set(feat.idx, vMask);
     diagnostic.aligned = true;
 
-    console.log(`[focus-stack] Image #${feat.idx}: ${diagnostic.matchCount} matches, ${inliers} inliers, reproj=${diagnostic.reprojectionError.toFixed(2)}px, translation=${diagnostic.maxTranslation.toFixed(1)}px`);
+    log.info({ image: feat.idx, matches: diagnostic.matchCount, inliers, reproj: diagnostic.reprojectionError.toFixed(2), translation: diagnostic.maxTranslation.toFixed(1) }, 'Image aligned');
 
     srcPts.delete(); dstPts.delete(); hMask.delete(); H.delete();
     stagesMs.alignment += Date.now() - alignStart;

@@ -60,7 +60,8 @@ describe('POST /api/export', () => {
     testBase64 = await createTestPNG();
   });
 
-  it.each(['tiff', 'jpeg', 'png', 'webp', 'avif', 'psd'])('exports %s format', async (format) => {
+  // Free tier (anonymous) — JPEG and PNG allowed
+  it.each(['jpeg', 'png'])('exports %s format (free tier)', async (format) => {
     const res = await fetch(`${API}/api/export`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -69,6 +70,18 @@ describe('POST /api/export', () => {
     expect(res.status).toBe(200);
     const blob = await res.arrayBuffer();
     expect(blob.byteLength).toBeGreaterThan(0);
+  });
+
+  // Free tier (anonymous) — restricted formats return 403
+  it.each(['tiff', 'webp', 'avif', 'psd'])('blocks %s format for free tier', async (format) => {
+    const res = await fetch(`${API}/api/export`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64: testBase64, format }),
+    });
+    expect(res.status).toBe(403);
+    const data = await res.json();
+    expect(data.code).toBe('FORMAT_RESTRICTED');
   });
 
   it('returns 400 without image data', async () => {
@@ -80,14 +93,14 @@ describe('POST /api/export', () => {
     expect(res.status).toBe(400);
   });
 
-  it('defaults to TIFF when no format specified', async () => {
+  it('defaults to TIFF which is blocked for free tier', async () => {
     const res = await fetch(`${API}/api/export`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ imageBase64: testBase64 }),
     });
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toContain('tiff');
+    // Default format is TIFF, which requires Pro tier
+    expect(res.status).toBe(403);
   });
 });
 
