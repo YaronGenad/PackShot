@@ -3,6 +3,9 @@
  * and proxies Gemini API calls so API keys never reach the client bundle.
  */
 
+// Load .env before any other imports so env vars are available everywhere
+import 'dotenv/config';
+
 import express from "express";
 import multer from "multer";
 import path from "path";
@@ -13,11 +16,24 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import pino from "pino";
 import sharp from "sharp";
+import cookieParser from "cookie-parser";
 // @ts-ignore — librawspeed types declare module as "libraw"
 import LibRaw from "librawspeed";
-import { GoogleGenAI } from "@google/genai";
+// GoogleGenAI now used via ai-providers/gemini.ts adapter
 import { readPsd, writePsdBuffer, initializeCanvas } from "ag-psd";
 import { performFocusStack } from "./src/lib/focus-stack.js";
+import { authRouter } from "./src/lib/auth/routes.js";
+import { billingRouter } from "./src/lib/billing/routes.js";
+import { optionalAuth, getEffectiveTier, AuthenticatedRequest } from "./src/lib/auth/middleware.js";
+import { checkQuota, checkExportFormat, getMaxResolution, getMaxUploadFiles, TIER_LIMITS } from "./src/lib/tier/limits.js";
+import { consumeWatermarkExport, grantReward } from "./src/lib/rewards/rewards.js";
+import { initWatermark, applyWatermark } from "./src/lib/tier/watermark.js";
+import { creditsRouter } from "./src/lib/credits/routes.js";
+import { rewardsRouter } from "./src/lib/rewards/routes.js";
+import { checkAICredits, getAIProvider } from "./src/lib/credits/ai-credits.js";
+import { apiKeysRouter } from "./src/lib/studio-api/api-keys.js";
+import { v1Router } from "./src/lib/studio-api/v1-routes.js";
+import { webhooksRouter } from "./src/lib/studio-api/webhooks.js";
 
 /** Structured logger — JSON output, request tracking. */
 const log = pino({
@@ -92,11 +108,29 @@ log.info('Server starting');
 
 async function startServer() {
   try {
+    // Initialize watermark PNG for Free tier exports
+    await initWatermark();
+    log.info('Watermark initialized');
+
     const app = express();
     const PORT = 3000;
 
-  // Security headers — disable crossOriginEmbedderPolicy for WASM compatibility
-  app.use(helmet({ crossOriginEmbedderPolicy: false }));
+  // Security headers — relaxed CSP in dev for Vite HMR, strict in production
+  const isDev = process.env.NODE_ENV !== 'production';
+  app.use(helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: isDev ? false : {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'"],
+        objectSrc: ["'none'"],
+      },
+    },
+  }));
 
   // CORS — restrict to explicit origins in production
   const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'];
@@ -104,6 +138,12 @@ async function startServer() {
     origin: process.env.NODE_ENV === 'production' ? allowedOrigins : true,
     credentials: true,
   }));
+
+  // Cookie parser — needed for auth token cookies
+  app.use(cookieParser());
+
+  // Stripe webhook needs raw body — mount BEFORE json parser
+  app.post('/api/billing/webhook', express.raw({ type: 'application/json' }));
 
   app.use(express.json({ limit: '100mb' }));
   app.use(express.urlencoded({ limit: '100mb', extended: true }));
@@ -126,9 +166,24 @@ async function startServer() {
     next();
   });
 
+  // ── Auth, Billing, Credits & Studio API routes ───────────────────────
+  app.use('/api/auth', authRouter);
+  app.use('/api/billing', billingRouter);
+  app.use('/api/credits', creditsRouter);
+  app.use('/api/rewards', rewardsRouter);
+  app.use('/api/api-keys', apiKeysRouter);
+  app.use('/api/v1', v1Router);
+  app.use('/api/settings/webhooks', webhooksRouter);
+
   // Health check
   app.get("/api/ping", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
+  });
+
+  // Tier limits — returns limits for the current user's tier
+  app.get("/api/tier/limits", optionalAuth, (req: AuthenticatedRequest, res) => {
+    const tier = getEffectiveTier(req);
+    res.json({ tier, limits: TIER_LIMITS[tier] });
   });
 
   const uploadDir = path.join(process.cwd(), "uploads");
@@ -145,17 +200,23 @@ async function startServer() {
     }
   });
 
-  const upload = multer({ 
-    storage: storage,
-    limits: { 
-      fileSize: 100 * 1024 * 1024, // 100MB per file
-      files: 10 // Max 10 files at once
-    }
-  });
+  /** Create multer instance with dynamic file limit based on user tier. */
+  function createUpload(maxFiles: number) {
+    return multer({
+      storage,
+      limits: {
+        fileSize: 100 * 1024 * 1024, // 100MB per file
+        files: maxFiles,
+      },
+    });
+  }
 
   // Extract preview from any RAW format via librawspeed, fallback to Sharp for non-RAW
-  app.post("/api/process-raw", uploadLimiter, (req, res, next) => {
+  // No quota check here — this is just input extraction, quota is charged on focus-stack/generate
+  app.post("/api/process-raw", uploadLimiter, optionalAuth, (req: AuthenticatedRequest, res, next) => {
     log.debug('Processing /api/process-raw request');
+    const maxFiles = getMaxUploadFiles(req);
+    const upload = createUpload(maxFiles);
     upload.single("images")(req, res, (err) => {
       if (err) {
         log.error({ err }, 'Multer error');
@@ -262,10 +323,11 @@ async function startServer() {
           throw new Error("Could not extract preview. File may be corrupted or unsupported.");
         }
 
-        // Optimize: auto-rotate, resize, compress
+        // Optimize: auto-rotate, resize (tier-based), compress
+        const maxRes = getMaxResolution(req as AuthenticatedRequest);
         const optimized = await sharp(previewBuffer)
           .rotate()
-          .resize(2048, 2048, { fit: 'inside', withoutEnlargement: true })
+          .resize(maxRes, maxRes, { fit: 'inside', withoutEnlargement: true })
           .jpeg({ quality: 80, mozjpeg: true })
           .toBuffer();
 
@@ -305,7 +367,7 @@ async function startServer() {
   });
 
   // Export final image in multiple formats — TIFF, JPEG, PNG, WebP, AVIF, HEIC
-  app.post("/api/export", async (req, res) => {
+  app.post("/api/export", optionalAuth, checkExportFormat, async (req: AuthenticatedRequest, res) => {
     try {
       const { imageBase64, format = 'tiff' } = req.body;
       if (!imageBase64) {
@@ -372,6 +434,25 @@ async function startServer() {
           break;
       }
 
+      // Apply watermark for Free tier users — but first check for consumable credits
+      // (earned via shares, referrals, or purchased for $1). Consumption is atomic via Postgres RPC.
+      const tier = getEffectiveTier(req);
+      let shouldWatermark = TIER_LIMITS[tier].watermark && format !== 'psd';
+      if (shouldWatermark && req.user) {
+        const consumed = await consumeWatermarkExport(req.user.id);
+        if (consumed) {
+          shouldWatermark = false;
+          log.info({ userId: req.user.id }, 'Watermark credit consumed');
+        }
+      }
+      if (shouldWatermark) {
+        try {
+          outputBuffer = await applyWatermark(outputBuffer);
+        } catch (wmErr: any) {
+          log.warn({ err: wmErr }, 'Watermark application failed, exporting without');
+        }
+      }
+
       res.setHeader('Content-Type', contentType);
       res.setHeader('Content-Disposition', `attachment; filename=packshot-${timestamp}.${extension}`);
       res.send(outputBuffer);
@@ -388,7 +469,7 @@ async function startServer() {
   });
 
   // Deterministic focus stacking — OpenCV alignment + multi-scale compositing, no LLM
-  app.post("/api/focus-stack", stackLimiter, async (req, res) => {
+  app.post("/api/focus-stack", stackLimiter, optionalAuth, checkQuota, async (req: AuthenticatedRequest, res) => {
     const startTime = Date.now();
     try {
       const { images, options } = req.body;
@@ -448,114 +529,75 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // ── Gemini AI proxy endpoints — API key stays server-side only ─────────
+  // ── AI provider info ──────────────────────────────────────────────────
 
-  /** Get Gemini client using server-side key. */
-  const getGeminiAI = () => {
+  /** List available AI providers and which the user has BYOK keys for. */
+  app.get("/api/ai/providers", optionalAuth, async (req: AuthenticatedRequest, res) => {
+    const { PROVIDER_INFO } = await import('./src/lib/ai-providers/registry.js');
+    const providers = Object.entries(PROVIDER_INFO).map(([id, info]) => ({
+      id,
+      ...info,
+    }));
+    res.json({ providers, default: 'gemini' });
+  });
+
+  // ── AI proxy endpoints — multi-provider via adapter pattern ─────────
+
+  /**
+   * Fallback: get a Gemini provider using server key (for legacy key management
+   * endpoints and when checkAICredits middleware hasn't run).
+   */
+  const getFallbackProvider = () => {
     if (!geminiApiKey) throw new Error('GEMINI_API_KEY not configured. Enter a key or set GEMINI_API_KEY env var.');
-    return new GoogleGenAI({ apiKey: geminiApiKey });
+    const { GeminiProvider } = require('./src/lib/ai-providers/gemini.js');
+    return new GeminiProvider(geminiApiKey);
   };
 
-  /** Generate studio packshot via Gemini — pure white bg, zero creativity. */
-  app.post("/api/generate-packshot", stackLimiter, async (req, res) => {
+  /** Generate studio packshot — uses resolved provider from checkAICredits. */
+  app.post("/api/generate-packshot", stackLimiter, optionalAuth, checkAICredits, async (req: AuthenticatedRequest, res) => {
     try {
       const { images } = req.body;
       if (!images?.length) return res.status(400).json({ error: 'No images provided' });
 
-      const ai = getGeminiAI();
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-image-preview',
-        contents: {
-          parts: [
-            { text: 'Generate a professional, commercial-grade packshot of the product shown in these images. Follow the system instructions strictly: PURE WHITE background, ZERO creativity, EXACT product fidelity. Create ONE high-quality "Hero Shot" that represents the product perfectly.' },
-            ...images.map((img: any) => ({ inlineData: { data: img.base64, mimeType: img.mimeType } })),
-          ],
-        },
-        config: {
-          systemInstruction: 'YOU ARE A TECHNICAL PRODUCT PHOTOGRAPHY SYNTHESIS ENGINE. STRICT REQUIREMENTS: 1. BACKGROUND: ABSOLUTE PURE WHITE (#FFFFFF). 2. FIDELITY: IDENTICAL REPLICA OF SOURCE. 3. CREATIVITY: ZERO. 4. LIGHTING: EVEN STUDIO. 5. COMPOSITION: CENTERED, SHARP FOCUS.',
-          imageConfig: { aspectRatio: '1:1', imageSize: '1K' },
-        },
-      });
+      const provider = getAIProvider(req) || getFallbackProvider();
+      const result = await provider.generatePackshot(images);
 
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          return res.json({ image: `data:image/png;base64,${part.inlineData.data}` });
-        }
-      }
-      res.status(500).json({ error: 'No image generated' });
+      res.json(result);
     } catch (error: any) {
-      log.error({ err: error }, 'Generate packshot error');
+      log.error({ err: error, provider: (req as any)._aiProviderName }, 'Generate packshot error');
       const status = error.message?.includes('API_KEY') || error.message?.includes('not found') ? 401 : 500;
       res.status(status).json({ error: error.message || 'Generation failed' });
     }
   });
 
-  /** Homogenize lighting — reduce burnt highlights, lift shadows. */
-  app.post("/api/homogenize", stackLimiter, async (req, res) => {
+  /** Homogenize lighting — uses resolved provider. */
+  app.post("/api/homogenize", stackLimiter, optionalAuth, checkAICredits, async (req: AuthenticatedRequest, res) => {
     try {
       const { currentImage, sourceImages, burnt = 15, dark = 15 } = req.body;
       if (!currentImage || !sourceImages?.length) return res.status(400).json({ error: 'Missing image data' });
 
-      const ai = getGeminiAI();
-      const currentBase64 = currentImage.replace(/^data:image\/\w+;base64,/, '');
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-image-preview',
-        contents: {
-          parts: [
-            { text: `Apply lighting homogenization: reduce overexposed highlights by ${burnt}%, lift underexposed shadows by ${dark}%. Maintain product fidelity and pure white background.` },
-            { inlineData: { data: currentBase64, mimeType: 'image/png' } },
-            ...sourceImages.map((img: any) => ({ inlineData: { data: img.base64, mimeType: img.mimeType } })),
-          ],
-        },
-        config: {
-          systemInstruction: 'YOU ARE A TECHNICAL PRODUCT PHOTOGRAPHY LIGHTING SPECIALIST. Normalize lighting. Maintain product fidelity. Keep background pure white.',
-          imageConfig: { aspectRatio: '1:1', imageSize: '1K' },
-        },
-      });
+      const provider = getAIProvider(req) || getFallbackProvider();
+      const result = await provider.homogenize(currentImage, sourceImages, burnt, dark);
 
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          return res.json({ image: `data:image/png;base64,${part.inlineData.data}` });
-        }
-      }
-      res.status(500).json({ error: 'No image generated' });
+      res.json(result);
     } catch (error: any) {
-      log.error({ err: error }, 'Homogenize error');
+      log.error({ err: error, provider: (req as any)._aiProviderName }, 'Homogenize error');
       res.status(500).json({ error: error.message || 'Homogenization failed' });
     }
   });
 
-  /** Targeted edit via user prompt — change color, remove label, etc. */
-  app.post("/api/edit-packshot", stackLimiter, async (req, res) => {
+  /** Targeted edit via user prompt — uses resolved provider. */
+  app.post("/api/edit-packshot", stackLimiter, optionalAuth, checkAICredits, async (req: AuthenticatedRequest, res) => {
     try {
       const { currentImage, sourceImages, prompt } = req.body;
       if (!currentImage || !prompt) return res.status(400).json({ error: 'Missing image or prompt' });
 
-      const ai = getGeminiAI();
-      const currentBase64 = currentImage.replace(/^data:image\/\w+;base64,/, '');
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.1-flash-image-preview',
-        contents: {
-          parts: [
-            { text: `Apply this specific modification: "${prompt}". Only change what's requested. Maintain product fidelity and pure white background.` },
-            { inlineData: { data: currentBase64, mimeType: 'image/png' } },
-            ...(sourceImages || []).map((img: any) => ({ inlineData: { data: img.base64, mimeType: img.mimeType } })),
-          ],
-        },
-        config: {
-          systemInstruction: 'YOU ARE A TECHNICAL PRODUCT PHOTOGRAPHY EDITOR. Apply ONLY the requested change. Maintain fidelity for everything else. Keep background pure white.',
-          imageConfig: { aspectRatio: '1:1', imageSize: '1K' },
-        },
-      });
+      const provider = getAIProvider(req) || getFallbackProvider();
+      const result = await provider.editImage(currentImage, sourceImages || [], prompt);
 
-      for (const part of response.candidates?.[0]?.content?.parts || []) {
-        if (part.inlineData) {
-          return res.json({ image: `data:image/png;base64,${part.inlineData.data}` });
-        }
-      }
-      res.status(500).json({ error: 'No image generated' });
+      res.json(result);
     } catch (error: any) {
-      log.error({ err: error }, 'Edit packshot error');
+      log.error({ err: error, provider: (req as any)._aiProviderName }, 'Edit packshot error');
       res.status(500).json({ error: error.message || 'Edit failed' });
     }
   });
