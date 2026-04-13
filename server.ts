@@ -142,7 +142,7 @@ async function startServer() {
   // Cookie parser — needed for auth token cookies
   app.use(cookieParser());
 
-  // Stripe webhook needs raw body — mount BEFORE json parser
+  // PayPal webhook needs raw body for signature verification — mount BEFORE json parser
   app.post('/api/billing/webhook', express.raw({ type: 'application/json' }));
 
   app.use(express.json({ limit: '100mb' }));

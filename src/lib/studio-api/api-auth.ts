@@ -43,8 +43,10 @@ export function apiKeyAuth(req: AuthenticatedRequest, res: Response, next: NextF
       id: profile.id,
       email: profile.email,
       name: profile.name,
+      storedTier: profile.tier,
       tier: profile.tier,
       stripe_customer_id: profile.stripe_customer_id,
+      paypal_payer_id: profile.paypal_payer_id,
     };
 
     next();

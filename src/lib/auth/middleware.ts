@@ -15,6 +15,7 @@ export interface AuthenticatedRequest extends Request {
     tier: 'free' | 'pro' | 'studio'; // effective tier (already accounts for granted_pro_until)
     storedTier: 'free' | 'pro' | 'studio'; // the actual tier column in DB (for UI to show)
     stripe_customer_id: string | null;
+    paypal_payer_id: string | null;
     granted_pro_until?: string | null;
     usage?: {
       deterministic_count: number;
@@ -76,6 +77,7 @@ export function authMiddleware(req: AuthenticatedRequest, res: Response, next: N
       storedTier: profile.tier,
       tier: computeEffectiveTier(profile.tier, profile.granted_pro_until),
       stripe_customer_id: profile.stripe_customer_id,
+      paypal_payer_id: profile.paypal_payer_id,
       granted_pro_until: profile.granted_pro_until,
     };
 
@@ -107,6 +109,7 @@ export function optionalAuth(req: AuthenticatedRequest, res: Response, next: Nex
           storedTier: profile.tier,
           tier: computeEffectiveTier(profile.tier, profile.granted_pro_until),
           stripe_customer_id: profile.stripe_customer_id,
+          paypal_payer_id: profile.paypal_payer_id,
           granted_pro_until: profile.granted_pro_until,
         };
       }

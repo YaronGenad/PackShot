@@ -232,11 +232,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const openBillingPortal = async () => {
-    const res = await fetch('/api/billing/portal', { credentials: 'include' });
-    const data = await res.json();
-    if (data.url) {
-      window.location.href = data.url;
-    }
+    // PayPal doesn't have a hosted portal — redirect to PayPal auto-pay management
+    window.location.href = 'https://www.paypal.com/myaccount/autopay';
   };
 
   return (

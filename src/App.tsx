@@ -33,12 +33,37 @@ export default function App() {
     return () => window.removeEventListener('packshot:navigate', handleNav);
   }, []);
 
-  // Check for checkout query params on load
+  // Handle PayPal return URLs and checkout query params on load
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (params.get('checkout') === 'success' || params.get('credits') === 'success') {
+    const subscriptionId = params.get('subscription_id');
+    const orderToken = params.get('token');
+
+    if (subscriptionId) {
+      // Subscription was approved — webhook will handle the tier update
       setPage('account');
-      // Clean up URL
+      window.history.replaceState({}, '', window.location.pathname);
+      return;
+    }
+
+    if (orderToken && !subscriptionId) {
+      // One-time order approved — capture it
+      fetch('/api/billing/capture-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ orderId: orderToken }),
+      }).then(() => {
+        setPage('account');
+        window.history.replaceState({}, '', window.location.pathname);
+      }).catch(() => {
+        window.history.replaceState({}, '', window.location.pathname);
+      });
+      return;
+    }
+
+    if (params.get('checkout') === 'success' || params.get('credits') === 'success' || params.get('watermark') === 'removed') {
+      setPage('account');
       window.history.replaceState({}, '', window.location.pathname);
     }
   }, []);
