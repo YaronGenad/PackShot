@@ -170,8 +170,8 @@ export default function App() {
         <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 mix-blend-overlay" />
       </div>
 
-      {/* Header */}
-      <header className="relative z-10 border-b border-white/5 bg-black/40 backdrop-blur-xl">
+      {/* Header — z-40 so dropdown menus (z-50 within) render above main content (z-10) */}
+      <header className="relative z-40 border-b border-white/5 bg-black/40 backdrop-blur-xl">
         <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
           <button onClick={() => setPage('home')} className="flex items-center space-x-4 group">
             <div className="w-10 h-10 bg-orange-500 rounded-xl flex items-center justify-center shadow-lg shadow-orange-500/20 group-hover:scale-105 transition-transform">
@@ -248,7 +248,7 @@ export default function App() {
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
             exit={{ opacity: 0, height: 0 }}
-            className="relative z-10 md:hidden border-b border-white/5 bg-black/80 backdrop-blur-xl overflow-hidden"
+            className="relative z-40 md:hidden border-b border-white/5 bg-black/80 backdrop-blur-xl overflow-hidden"
           >
             <nav className="flex flex-col p-4 space-y-2">
               <button onClick={() => { setPage('pricing'); setMobileMenuOpen(false); }}
