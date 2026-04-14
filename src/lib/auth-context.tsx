@@ -64,6 +64,7 @@ interface AuthContextType extends AuthState {
   refreshCredits: () => Promise<void>;
   refreshRewards: () => Promise<void>;
   createCheckout: (tier: 'pro' | 'studio', interval?: 'month' | 'year') => Promise<void>;
+  changePlan: (tier: 'pro' | 'studio', interval?: 'month' | 'year') => Promise<void>;
   buyCredits: (pack: '50' | '120' | '300') => Promise<void>;
   removeWatermark: (onComplete?: () => void) => Promise<void>;
   openBillingPortal: () => Promise<void>;
@@ -191,8 +192,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
-    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    } catch (err) {
+      console.warn('logout: server call failed, clearing local state anyway', err);
+    }
     setState({ user: null, usage: null, subscription: null, aiCredits: null, rewards: null, loading: false, error: null });
+    // Hard reload so any cached auth state in deeply-nested components is reset
+    window.location.href = '/';
   };
 
   const createCheckout = async (tier: 'pro' | 'studio', interval: 'month' | 'year' = 'month') => {
@@ -257,9 +264,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  const changePlan = async (tier: 'pro' | 'studio', interval: 'month' | 'year' = 'month') => {
+    try {
+      const res = await fetch('/api/billing/change-plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ tier, interval }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.error('Change plan error:', data.error);
+        alert(data.error || 'Failed to change plan');
+        return;
+      }
+      if (data.url) window.location.href = data.url;
+    } catch (err) {
+      console.error('Change plan failed:', err);
+      alert('Network error while changing plan');
+    }
+  };
+
   const openBillingPortal = async () => {
-    // PayPal doesn't have a hosted portal — redirect to PayPal auto-pay management
-    window.location.href = 'https://www.paypal.com/myaccount/autopay';
+    // PayPal doesn't have a hosted portal — open their auto-pay management page.
+    // Use a new tab so the PackShot session and in-progress work are preserved.
+    const url = 'https://www.paypal.com/myaccount/autopay';
+    const tab = window.open(url, '_blank', 'noopener,noreferrer');
+    if (!tab) {
+      // Popup blocker active — fall back to same-tab redirect
+      window.location.href = url;
+    }
   };
 
   return (
@@ -272,6 +306,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       refreshCredits: fetchCredits,
       refreshRewards: fetchRewards,
       createCheckout,
+      changePlan,
       buyCredits,
       removeWatermark,
       openBillingPortal,

@@ -97,7 +97,7 @@ export const BYOKSettings: React.FC<BYOKSettingsProps> = ({ isOpen, onClose }) =
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
+    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[60] flex items-center justify-center p-4" role="dialog" aria-modal="true">
       <div className="bg-[#151619] border border-white/10 rounded-2xl max-w-lg w-full p-8 shadow-2xl relative">
         <button
           onClick={onClose}

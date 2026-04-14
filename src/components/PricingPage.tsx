@@ -80,7 +80,7 @@ interface PricingPageProps {
 }
 
 export const PricingPage: React.FC<PricingPageProps> = ({ onBack }) => {
-  const { user, createCheckout } = useAuth();
+  const { user, createCheckout, changePlan } = useAuth();
   const [interval, setInterval] = useState<'month' | 'year'>('month');
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [billingLoading, setBillingLoading] = useState(false);
@@ -91,7 +91,14 @@ export const PricingPage: React.FC<PricingPageProps> = ({ onBack }) => {
     if (!user) { setShowAuthModal(true); return; }
     setBillingLoading(true);
     try {
-      await createCheckout(tierId as 'pro' | 'studio', interval);
+      // Existing paid subscribers changing between Pro and Studio use PayPal's
+      // revise API so their current subscription is modified instead of creating
+      // a second one (which would cause double billing).
+      if (currentTier !== 'free') {
+        await changePlan(tierId as 'pro' | 'studio', interval);
+      } else {
+        await createCheckout(tierId as 'pro' | 'studio', interval);
+      }
     } finally {
       setBillingLoading(false);
     }

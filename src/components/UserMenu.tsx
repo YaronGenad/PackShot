@@ -123,6 +123,13 @@ export const UserMenu: React.FC = () => {
 
           {/* Actions */}
           <div className="p-2">
+            <button
+              onClick={() => { setShowDropdown(false); window.dispatchEvent(new CustomEvent('packshot:navigate', { detail: 'account' })); }}
+              className="w-full flex items-center gap-3 px-3 py-2.5 text-gray-400 hover:bg-white/5 rounded-lg transition-colors text-left"
+            >
+              <User className="w-4 h-4" />
+              <span className="text-xs font-mono uppercase tracking-widest">My Account</span>
+            </button>
             {tier === 'free' && (
               <button
                 onClick={() => { setShowDropdown(false); window.dispatchEvent(new CustomEvent('packshot:navigate', { detail: 'pricing' })); }}
