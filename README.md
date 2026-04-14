@@ -68,12 +68,15 @@ Real-time canvas adjustments: gamma (background/object separate), RGB balance, v
 - **Computer Vision:** @techstark/opencv-js (WebAssembly) — AKAZE, BFMatcher, findHomography, warpPerspective
 - **AI:** @google/genai (Gemini), openai (GPT-4o/DALL-E), xAI Grok — via adapter pattern
 - **Auth:** Supabase (PostgreSQL + Auth + RLS)
-- **Billing:** PayPal REST API (subscriptions + orders)
-- **Invoicing:** iCount (Israeli receipt system)
+- **Billing:** PayPal REST API (subscriptions, orders, revise/change-plan)
+- **Invoicing:** iCount (Israeli receipt system) with pending-receipts retry queue
+- **Email:** Resend with queue + retry worker (bounded to 3 attempts)
 - **CAPTCHA:** Cloudflare Turnstile
-- **Security:** helmet, express-rate-limit, CORS whitelist, file magic validation
-- **Logging:** pino (structured JSON)
-- **CI/CD:** GitHub Actions, Docker (multi-stage Alpine)
+- **Security:** helmet CSP (PayPal/Turnstile/Supabase-aware), express-rate-limit behind fly.io proxy, CORS whitelist, file magic validation, webhook idempotency
+- **Observability:** pino (structured JSON), Sentry (server + browser, lazy-loaded)
+- **Ops:** Past-due subscription cleanup cron, upload directory sweep, DB-aware healthcheck
+- **Admin:** Minimal `/#admin` dashboard (stats, user search, grant-credits, override-tier)
+- **CI/CD:** GitHub Actions, Docker (multi-stage Alpine), fly.io deployment
 
 ## Setup
 
@@ -124,18 +127,86 @@ Open http://localhost:3000
 
 ### Database
 
-Run migrations in Supabase SQL Editor (Dashboard > SQL Editor):
+Run migrations in Supabase SQL Editor (Dashboard > SQL Editor), in order:
 - `supabase/migrations/001_initial_schema.sql`
 - `supabase/migrations/002_webhooks.sql`
 - `supabase/migrations/003_email_queue.sql`
 - `supabase/migrations/004_rewards_system.sql`
 - `supabase/migrations/005_paypal.sql`
+- `supabase/migrations/006_atomic_increment.sql`
+- `supabase/migrations/007_performance_indexes.sql`
+- `supabase/migrations/008_processed_webhooks.sql` — PayPal webhook idempotency
+- `supabase/migrations/009_pending_receipts_and_email_retry.sql` — iCount retry queue + email retry counter
 
 ### Docker
 
 ```bash
 docker compose up
 ```
+
+## Deployment (fly.io)
+
+Primary region: `ams` (Amsterdam, closest to Israel). Config in [fly.toml](fly.toml).
+
+### One-time setup
+
+```bash
+# 1. Create persistent volume for /app/uploads
+fly volumes create uploads --size 10 --region ams
+
+# 2. Generate BYOK encryption key (save in password manager — NEVER changeable once set)
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+
+# 3. Set all runtime secrets (see .env.example for the full list)
+fly secrets set \
+  SUPABASE_URL=... SUPABASE_SERVICE_KEY=... SUPABASE_ANON_KEY=... \
+  PAYPAL_CLIENT_ID=... PAYPAL_SECRET=... PAYPAL_MODE=live PAYPAL_WEBHOOK_ID=... \
+  PAYPAL_PLAN_PRO_MONTHLY=P-... PAYPAL_PLAN_PRO_YEARLY=P-... \
+  PAYPAL_PLAN_STUDIO_MONTHLY=P-... PAYPAL_PLAN_STUDIO_YEARLY=P-... \
+  GEMINI_API_KEY=... ICOUNT_API_TOKEN=... BYOK_ENCRYPTION_KEY=<32b hex> \
+  TURNSTILE_SECRET_KEY=... RESEND_API_KEY=... SENTRY_DSN=... \
+  FROM_EMAIL="PackShot Studio <noreply@pack-shot.studio>" \
+  APP_URL=https://pack-shot-studio.fly.dev \
+  ALLOWED_ORIGINS=https://pack-shot-studio.fly.dev \
+  ADMIN_USER_IDS=<your_user_uuid>
+```
+
+### Deploy
+
+Frontend env vars are baked into the JS bundle — pass them as build args on every deploy:
+
+```bash
+fly deploy \
+  --build-arg VITE_SUPABASE_URL=... \
+  --build-arg VITE_SUPABASE_ANON_KEY=... \
+  --build-arg VITE_PAYPAL_CLIENT_ID=... \
+  --build-arg VITE_TURNSTILE_SITE_KEY=... \
+  --build-arg VITE_SENTRY_DSN=...
+```
+
+### PayPal webhook
+
+In the PayPal Developer dashboard, point the webhook URL at `https://<your-app>.fly.dev/api/billing/webhook` and subscribe to: `BILLING.SUBSCRIPTION.ACTIVATED`, `BILLING.SUBSCRIPTION.CANCELLED`, `BILLING.SUBSCRIPTION.SUSPENDED`, `BILLING.SUBSCRIPTION.UPDATED`, `PAYMENT.SALE.COMPLETED`, `CHECKOUT.ORDER.APPROVED`.
+
+Replayed events are deduped server-side via the `processed_webhooks` table — no risk of double-crediting.
+
+### Optional: Sentry
+
+```bash
+npm install @sentry/node @sentry/react
+# then set SENTRY_DSN and VITE_SENTRY_DSN
+```
+
+Without these packages, the Sentry wrapper is a no-op and the server still starts cleanly.
+
+### Verifying a deploy
+
+```bash
+curl https://<app>.fly.dev/api/ping
+# Expected: {"status":"ok","db":"ok","timestamp":"..."}
+```
+
+The healthcheck queries Supabase before returning 200, so fly.io pulls the VM out of rotation automatically if the DB is unreachable.
 
 ## Architecture
 

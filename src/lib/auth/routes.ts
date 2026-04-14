@@ -5,10 +5,12 @@
 
 import { Router, Request, Response } from 'express';
 import { createClient } from '@supabase/supabase-js';
+import pino from 'pino';
 import { supabaseAdmin, getProfile, getOrCreateUsage, getActiveSubscription } from '../db/supabase.js';
 import { authMiddleware, AuthenticatedRequest } from './middleware.js';
 import { sendWelcomeEmail } from '../email/notifications.js';
 
+const log = pino({ level: 'info' });
 const router = Router();
 
 /** Supabase anon key for client-side auth operations. */
@@ -93,12 +95,14 @@ router.post('/register', async (req: Request, res: Response) => {
         .from('referrals')
         .update({ signup_ip: req.ip || null })
         .eq('referred_user_id', data.user.id)
-        .then(() => {}, () => {});
+        .then(() => {}, (err) => { log.warn({ err }, 'Failed to update referral signup_ip'); });
     }
 
     // Don't auto-login — user must confirm email first
     // Send welcome email (non-blocking)
-    sendWelcomeEmail(email, name || email.split('@')[0]).catch(() => {});
+    sendWelcomeEmail(email, name || email.split('@')[0]).catch((err) => {
+      log.error({ err }, 'Failed to send welcome email');
+    });
 
     res.status(201).json({
       message: 'Account created! Check your email to confirm your account.',
@@ -321,6 +325,104 @@ router.post('/reset-password', async (req: Request, res: Response) => {
     res.json({ message: 'Password updated successfully. You can now sign in.' });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to reset password' });
+  }
+});
+
+/**
+ * GET /api/auth/export-data — GDPR data export (Privacy Policy obligation).
+ * Returns a JSON blob with all user-scoped records. Sensitive fields (password hash,
+ * API key hashes, encrypted BYOK keys) are intentionally omitted.
+ */
+router.get('/export-data', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const since = new Date();
+    since.setMonth(since.getMonth() - 12);
+    const sinceMonth = since.toISOString().slice(0, 7);
+
+    const [profile, subscriptions, usage, rewardClaims, referrals, apiKeys, aiKeys] = await Promise.all([
+      supabaseAdmin.from('profiles').select('*').eq('id', user.id).single(),
+      supabaseAdmin.from('subscriptions').select('*').eq('user_id', user.id),
+      supabaseAdmin.from('usage').select('*').eq('user_id', user.id).gte('month', sinceMonth),
+      supabaseAdmin.from('reward_claims').select('*').eq('user_id', user.id),
+      supabaseAdmin.from('referrals').select('*').or(`referrer_id.eq.${user.id},referred_user_id.eq.${user.id}`),
+      supabaseAdmin.from('api_keys').select('id, key_prefix, name, last_used, created_at').eq('user_id', user.id),
+      supabaseAdmin.from('user_ai_keys').select('id, provider, created_at').eq('user_id', user.id),
+    ]);
+
+    res.setHeader('Content-Disposition', `attachment; filename="packshot-data-${user.id}.json"`);
+    res.json({
+      exported_at: new Date().toISOString(),
+      user_id: user.id,
+      profile: profile.data,
+      subscriptions: subscriptions.data || [],
+      usage: usage.data || [],
+      reward_claims: rewardClaims.data || [],
+      referrals: referrals.data || [],
+      api_keys: apiKeys.data || [],
+      ai_keys_providers: aiKeys.data || [],
+    });
+  } catch (err: any) {
+    log.error({ err }, 'export-data error');
+    res.status(500).json({ error: 'Failed to export data' });
+  }
+});
+
+/**
+ * DELETE /api/auth/account — GDPR account deletion (Privacy Policy obligation).
+ * Requires password re-auth. Cancels active PayPal subscriptions, then deletes
+ * the Supabase auth.users row which cascades to profiles/usage/api_keys/user_ai_keys.
+ * Referral/reward rows remain (FK is ON DELETE SET NULL where applicable) for audit.
+ */
+router.delete('/account', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const { password, confirm } = req.body;
+
+    if (confirm !== 'DELETE') {
+      return res.status(400).json({ error: 'Set confirm="DELETE" in body to confirm account deletion' });
+    }
+    if (!password) {
+      return res.status(400).json({ error: 'Password is required to confirm deletion' });
+    }
+
+    // Re-authenticate with password
+    const supabaseClient = createClient(supabaseUrl, supabaseAnonKey);
+    const { error: authErr } = await supabaseClient.auth.signInWithPassword({ email: user.email, password });
+    if (authErr) {
+      return res.status(401).json({ error: 'Password incorrect' });
+    }
+
+    // Cancel any active PayPal subscriptions before deletion
+    const { data: activeSubs } = await supabaseAdmin
+      .from('subscriptions')
+      .select('paypal_subscription_id')
+      .eq('user_id', user.id)
+      .eq('status', 'active')
+      .not('paypal_subscription_id', 'is', null);
+
+    for (const sub of activeSubs || []) {
+      try {
+        const { cancelSubscription } = await import('../billing/paypal.js');
+        await cancelSubscription(sub.paypal_subscription_id, 'Account deleted by user');
+      } catch (err: any) {
+        log.warn({ err: err.message, subId: sub.paypal_subscription_id }, 'Failed to cancel PayPal subscription during account deletion');
+      }
+    }
+
+    // Delete the auth.users row — cascades to profiles and all child tables via FK
+    const { error: delErr } = await supabaseAdmin.auth.admin.deleteUser(user.id);
+    if (delErr) {
+      log.error({ err: delErr, userId: user.id }, 'Failed to delete Supabase auth user');
+      return res.status(500).json({ error: 'Failed to delete account', details: delErr.message });
+    }
+
+    res.clearCookie('sb-access-token', { path: '/' });
+    res.clearCookie('sb-refresh-token', { path: '/' });
+    res.json({ success: true, message: 'Account deleted successfully' });
+  } catch (err: any) {
+    log.error({ err }, 'delete account error');
+    res.status(500).json({ error: 'Failed to delete account', details: err.message });
   }
 });
 

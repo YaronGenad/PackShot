@@ -102,6 +102,32 @@ export async function cancelSubscription(subscriptionId: string, reason: string)
 }
 
 /**
+ * Revise a subscription to a different plan (upgrade/downgrade between Pro and Studio).
+ * Returns an approval URL the user must visit to confirm the change.
+ */
+export async function reviseSubscription(
+  subscriptionId: string,
+  newPlanId: string,
+  returnUrl: string,
+  cancelUrl: string,
+): Promise<{ approvalUrl: string }> {
+  const data = await paypalRequest('POST', `/v1/billing/subscriptions/${subscriptionId}/revise`, {
+    plan_id: newPlanId,
+    application_context: {
+      brand_name: 'PackShot',
+      locale: 'en-US',
+      shipping_preference: 'NO_SHIPPING',
+      user_action: 'SUBSCRIBE_NOW',
+      return_url: returnUrl,
+      cancel_url: cancelUrl,
+    },
+  });
+  const approvalLink = data?.links?.find((l: any) => l.rel === 'approve');
+  if (!approvalLink) throw new Error('No approval URL in PayPal revise response');
+  return { approvalUrl: approvalLink.href };
+}
+
+/**
  * Create a PayPal order (one-time payment) and return the approval URL.
  */
 export async function createOrder(

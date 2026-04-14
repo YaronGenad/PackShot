@@ -156,41 +156,6 @@ describe('POST /api/focus-stack', () => {
   });
 });
 
-describe('Gemini API key management', () => {
-  it('GET /api/has-gemini-key returns hasKey boolean', async () => {
-    const res = await fetch(`${API}/api/has-gemini-key`);
-    const data = await res.json();
-    expect(res.status).toBe(200);
-    expect(typeof data.hasKey).toBe('boolean');
-  });
-
-  it('POST /api/set-gemini-key rejects invalid key', async () => {
-    const res = await fetch(`${API}/api/set-gemini-key`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: 'short' }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it('POST /api/set-gemini-key accepts valid key', async () => {
-    const res = await fetch(`${API}/api/set-gemini-key`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key: 'test-key-that-is-long-enough' }),
-    });
-    expect(res.status).toBe(200);
-
-    // Verify it was set
-    const check = await fetch(`${API}/api/has-gemini-key`);
-    const data = await check.json();
-    expect(data.hasKey).toBe(true);
-
-    // Reset
-    await fetch(`${API}/api/reset-gemini-key`, { method: 'POST' });
-  });
-});
-
 describe('Security headers', () => {
   it('includes security headers from helmet', async () => {
     const res = await fetch(`${API}/api/ping`);

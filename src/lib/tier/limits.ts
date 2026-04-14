@@ -4,9 +4,12 @@
  */
 
 import { Response, NextFunction } from 'express';
+import pino from 'pino';
 import { AuthenticatedRequest, getEffectiveTier } from '../auth/middleware.js';
 import { getOrCreateUsage, incrementDeterministicCount, supabaseAdmin, getProfile } from '../db/supabase.js';
 import { sendUsageWarningEmail } from '../email/notifications.js';
+
+const log = pino({ level: 'info' });
 
 /** Tier configuration — single source of truth. */
 export const TIER_LIMITS = {
@@ -102,7 +105,9 @@ export async function checkQuota(req: AuthenticatedRequest, res: Response, next:
     // Studio: warn at 4000, others: warn at 90%
     const warningThreshold = tier === 'studio' ? 4000 : Math.floor(available * 0.9);
     if (newCount === warningThreshold && req.user.email) {
-      sendUsageWarningEmail(req.user.email, newCount, available, tier).catch(() => {});
+      sendUsageWarningEmail(req.user.email, newCount, available, tier).catch((err) => {
+        log.error({ err }, 'Failed to send usage warning email');
+      });
     }
 
     next();

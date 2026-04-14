@@ -1,0 +1,63 @@
+# fly.toml — PackShot Studio
+# Deploy: fly deploy
+# Secrets: fly secrets set KEY=value
+
+app = "pack-shot-studio"
+primary_region = "ams"  # Amsterdam — closest to Israel
+
+[build]
+  dockerfile = "Dockerfile"
+
+  # VITE_ vars are baked into the JS bundle at build time.
+  # Set these via: fly secrets set VITE_SUPABASE_URL=... etc.
+  # fly.io passes secrets as build args automatically when listed here.
+  [build.args]
+    VITE_SUPABASE_URL      = ""
+    VITE_SUPABASE_ANON_KEY = ""
+    VITE_PAYPAL_CLIENT_ID  = ""
+    VITE_TURNSTILE_SITE_KEY = ""
+
+[http_service]
+  internal_port = 3000
+  force_https   = true
+  auto_stop_machines  = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type       = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+[[vm]]
+  memory   = "2gb"
+  cpu_kind = "shared"
+  cpus     = 1
+
+# Persistent volume for uploaded RAW files
+[[mounts]]
+  source      = "uploads"
+  destination = "/app/uploads"
+
+[env]
+  NODE_ENV = "production"
+  # Runtime secrets (set via `fly secrets set`):
+  # APP_URL                 = https://pack-shot-studio.fly.dev  (or custom domain)
+  # ALLOWED_ORIGINS         = https://pack-shot-studio.fly.dev
+  # SUPABASE_URL            = ...
+  # SUPABASE_SERVICE_KEY    = ...
+  # SUPABASE_ANON_KEY       = ...
+  # PAYPAL_CLIENT_ID        = ...
+  # PAYPAL_SECRET           = ...
+  # PAYPAL_MODE             = live
+  # PAYPAL_WEBHOOK_ID       = ...
+  # PAYPAL_PLAN_PRO_MONTHLY    = P-...
+  # PAYPAL_PLAN_PRO_YEARLY     = P-...
+  # PAYPAL_PLAN_STUDIO_MONTHLY = P-...
+  # PAYPAL_PLAN_STUDIO_YEARLY  = P-...
+  # GEMINI_API_KEY          = ...
+  # ICOUNT_API_TOKEN        = ...
+  # BYOK_ENCRYPTION_KEY     = (32-byte hex — never change after first user stores a key)
+  # TURNSTILE_SECRET_KEY    = ...
+  # RESEND_API_KEY          = ...
+  # FROM_EMAIL              = PackShot Studio <noreply@pack-shot.studio>

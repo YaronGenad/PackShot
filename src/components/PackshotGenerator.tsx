@@ -15,7 +15,16 @@ const generatePackshot = async (images: { base64: string; mimeType: string }[], 
     method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
     body: JSON.stringify({ images, provider }),
   });
-  if (!res.ok) { const err = await res.json(); throw new Error(err.error || 'Generation failed'); }
+  if (!res.ok) { const err = await res.json(); const e = new Error(err.error || 'Generation failed'); (e as any).code = err.code; (e as any).status = res.status; throw e; }
+  return (await res.json()).image;
+};
+
+const sharpenWithAI = async (image: { base64: string; mimeType: string }, provider?: string): Promise<string> => {
+  const res = await fetch('/api/sharpen', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'include',
+    body: JSON.stringify({ image, provider }),
+  });
+  if (!res.ok) { const err = await res.json(); const e = new Error(err.error || 'Sharpening failed'); (e as any).code = err.code; (e as any).status = res.status; throw e; }
   return (await res.json()).image;
 };
 
@@ -84,6 +93,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
   const [useWatermarkCredit, setUseWatermarkCredit] = useState(false);
   const tier = user?.tier || 'free';
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isSharpening, setIsSharpening] = useState(false);
   const [generationMethod, setGenerationMethod] = useState<'ai' | 'mathematical' | 'aligned-stack'>('aligned-stack');
   const [isHomogenizing, setIsHomogenizing] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
@@ -154,8 +164,11 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
           setImageLoadCounter(c => c + 1);
         };
       } catch (err: any) {
-        console.error('Generation error:', err);
-        if (err.message === 'API_KEY_ERROR') {
+        if (err.code === 'AI_CREDITS_EXHAUSTED' || err.status === 402) {
+          setError('No AI credits remaining. Purchase credits or add your own API key under Settings → AI Keys.');
+        } else if (err.code === 'AI_ACCESS_DENIED' || err.status === 403) {
+          setError('AI features require a Pro or Studio subscription.');
+        } else if (err.message === 'API_KEY_ERROR') {
           setError('API Key error. Please refresh and select a valid key.');
         } else {
           setError('Failed to generate packshot. Please try again.');
@@ -167,6 +180,36 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
       await handleMathematicalStacking();
     } else {
       await handleAlignedStacking();
+    }
+  };
+
+  /** AI sharpening pipeline — analyze with AI, run OpenCV chain, optional AI final pass. */
+  const handleSharpen = async () => {
+    if (images.length === 0) return;
+    setIsSharpening(true);
+    setError(null);
+    try {
+      const result = await sharpenWithAI(images[0], aiProvider);
+      setResultImage(result);
+      refreshUser();
+
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.src = result;
+      img.onload = () => {
+        originalImageRef.current = img;
+        setImageLoadCounter(c => c + 1);
+      };
+    } catch (err: any) {
+      if (err.code === 'AI_CREDITS_EXHAUSTED' || err.status === 402) {
+        setError('No AI credits remaining. Purchase credits or add your own API key under Settings → AI Keys.');
+      } else if (err.code === 'AI_ACCESS_DENIED' || err.status === 403) {
+        setError('AI features require a Pro or Studio subscription.');
+      } else {
+        setError('Failed to sharpen image. Please try again.');
+      }
+    } finally {
+      setIsSharpening(false);
     }
   };
 
@@ -919,7 +962,21 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                   </>
                 )}
               </button>
-              
+
+              {generationMethod === 'ai' && (
+                <button
+                  onClick={handleSharpen}
+                  disabled={isSharpening || isGenerating}
+                  className="w-full bg-gray-800 hover:bg-gray-700 disabled:bg-gray-900 disabled:text-gray-600 text-gray-200 font-bold py-4 rounded-2xl transition-all active:scale-95 flex items-center justify-center space-x-3 border border-gray-700 uppercase tracking-[0.15em] text-xs mt-2"
+                >
+                  {isSharpening ? (
+                    <><Loader2 className="w-5 h-5 animate-spin" /><span>Analyzing & Sharpening...</span></>
+                  ) : (
+                    <><Zap className="w-5 h-5 text-orange-400" /><span>Sharpen with AI</span></>
+                  )}
+                </button>
+              )}
+
               <p className="text-[9px] text-gray-500 font-mono uppercase tracking-[0.15em] text-center px-4 leading-relaxed">
                 {generationMethod === 'ai'
                   ? `Uses ${aiProvider === 'openai' ? 'OpenAI GPT-4o' : aiProvider === 'grok' ? 'xAI Grok' : 'Gemini 3.1 Flash'} to synthesize a perfect studio packshot with pure white background.`
@@ -1207,7 +1264,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
             <div className="md:col-span-2 space-y-6">
               <div className="aspect-square rounded-2xl border-2 border-dashed border-white/10 bg-[#151619] flex items-center justify-center relative overflow-hidden shadow-2xl">
                 <AnimatePresence mode="wait">
-                  {isGenerating || isHomogenizing || isEditing ? (
+                  {isGenerating || isHomogenizing || isEditing || isSharpening ? (
                     <motion.div 
                       key="loading"
                       initial={{ opacity: 0 }}
@@ -1221,10 +1278,12 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
                       </div>
                       <div className="space-y-2">
                         <p className="text-white font-medium">
-                          {isHomogenizing ? 'Homogenizing Lighting' : isEditing ? 'Applying Targeted Edits' : generationMethod === 'ai' ? 'Technical Synthesis in Progress' : generationMethod === 'aligned-stack' ? 'Aligned Focus Stacking' : 'Quick Focus Stacking'}
+                          {isSharpening ? 'AI-Guided Sharpening' : isHomogenizing ? 'Homogenizing Lighting' : isEditing ? 'Applying Targeted Edits' : generationMethod === 'ai' ? 'Technical Synthesis in Progress' : generationMethod === 'aligned-stack' ? 'Aligned Focus Stacking' : 'Quick Focus Stacking'}
                         </p>
                         <p className="text-xs text-gray-500 max-w-[200px]">
-                          {isHomogenizing 
+                          {isSharpening
+                            ? 'AI analyzes noise and blur levels, then applies NL-Means denoising, deconvolution, guided filter, CLAHE, and ringing suppression.'
+                            : isHomogenizing
                             ? 'Balancing overexposed highlights and underexposed shadows while maintaining product fidelity.'
                             : isEditing
                             ? 'Applying your specific modifications while preserving the core product identity.'
@@ -1270,7 +1329,7 @@ export const PackshotGenerator: React.FC<PackshotGeneratorProps> = ({ images, on
             </div>
 
             {/* Prompt Edit Bar */}
-            {resultImage && !isGenerating && !isHomogenizing && !isEditing && (
+            {resultImage && !isGenerating && !isHomogenizing && !isEditing && !isSharpening && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}

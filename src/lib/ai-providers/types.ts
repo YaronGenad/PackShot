@@ -50,6 +50,28 @@ export interface AIProvider {
     sourceImages: ImageInput[],
     prompt: string
   ): Promise<AIResult>;
+
+  /**
+   * Analyze an image and return optimal parameters for the sharpening pipeline.
+   * Returns structured JSON — no image generation, just vision analysis.
+   */
+  analyzeForSharpening(image: ImageInput): Promise<SharpenAnalysis>;
+}
+
+/**
+ * AI-determined parameters for the sharpening pipeline.
+ * All values are conservative by default to prevent over-processing.
+ */
+export interface SharpenAnalysis {
+  noise_level: 'low' | 'medium' | 'high';
+  blur_level: 'none' | 'slight' | 'moderate' | 'severe';
+  denoise: { h: number; hColor: number; templateWindow: number; searchWindow: number };
+  deconvolve: { strength: number; iterations: number; noise_reg: number };
+  guided: { radius: number; eps: number };
+  clahe: { clipLimit: number; tileGridSize: number; apply: boolean };
+  ringing: { suppress: boolean; threshold: number };
+  needs_ai_pass: boolean;
+  ai_pass_prompt: string;
 }
 
 /** Supported provider names — must match BYOK provider column. */

@@ -4,7 +4,8 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
-import type { AIProvider, ImageInput, AIResult } from './types.js';
+import type { AIProvider, ImageInput, AIResult, SharpenAnalysis } from './types.js';
+import { parseSharpenAnalysis, SHARPEN_ANALYSIS_PROMPT } from './sharpen-prompt.js';
 
 export class GeminiProvider implements AIProvider {
   readonly name = 'gemini' as const;
@@ -96,6 +97,22 @@ export class GeminiProvider implements AIProvider {
     });
 
     return this.extractImage(response);
+  }
+
+  async analyzeForSharpening(image: ImageInput): Promise<SharpenAnalysis> {
+    const response = await this.ai.models.generateContent({
+      model: 'gemini-2.0-flash',   // text-only response — no image generation needed
+      contents: {
+        parts: [
+          { text: SHARPEN_ANALYSIS_PROMPT },
+          { inlineData: { data: image.base64, mimeType: image.mimeType } },
+        ],
+      },
+      config: { responseMimeType: 'application/json' },
+    });
+
+    const text = response.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    return parseSharpenAnalysis(text);
   }
 
   /** Extract base64 image from Gemini response. */

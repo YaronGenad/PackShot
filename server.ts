@@ -22,6 +22,7 @@ import LibRaw from "librawspeed";
 // GoogleGenAI now used via ai-providers/gemini.ts adapter
 import { readPsd, writePsdBuffer, initializeCanvas } from "ag-psd";
 import { performFocusStack } from "./src/lib/focus-stack.js";
+import { sharpenImage, DEFAULT_SHARPEN_PARAMS } from "./src/lib/image-enhance.js";
 import { authRouter } from "./src/lib/auth/routes.js";
 import { billingRouter } from "./src/lib/billing/routes.js";
 import { optionalAuth, getEffectiveTier, AuthenticatedRequest } from "./src/lib/auth/middleware.js";
@@ -34,6 +35,12 @@ import { checkAICredits, getAIProvider } from "./src/lib/credits/ai-credits.js";
 import { apiKeysRouter } from "./src/lib/studio-api/api-keys.js";
 import { v1Router } from "./src/lib/studio-api/v1-routes.js";
 import { webhooksRouter } from "./src/lib/studio-api/webhooks.js";
+import { adminRouter } from "./src/lib/admin/routes.js";
+import { supabaseAdmin } from "./src/lib/db/supabase.js";
+import { runEmailRetry } from "./src/lib/email/retry-worker.js";
+import { runPastDueCleanup } from "./src/lib/billing/past-due-cleanup.js";
+import { processPendingReceipts } from "./src/lib/invoicing/icount.js";
+import { initSentry, Sentry } from "./src/lib/observability/sentry.js";
 
 /** Structured logger — JSON output, request tracking. */
 const log = pino({
@@ -106,7 +113,38 @@ function validateFileMagic(buffer: Buffer, ext: string): boolean {
 
 log.info('Server starting');
 
+/** Fail fast if critical environment variables are missing in production. */
+function validateEnv() {
+  if (process.env.NODE_ENV !== 'production') return;
+  const required = [
+    'APP_URL',
+    'ALLOWED_ORIGINS',
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_KEY',
+    'SUPABASE_ANON_KEY',
+    'PAYPAL_CLIENT_ID',
+    'PAYPAL_SECRET',
+    'PAYPAL_WEBHOOK_ID',
+    'PAYPAL_PLAN_PRO_MONTHLY',
+    'PAYPAL_PLAN_PRO_YEARLY',
+    'PAYPAL_PLAN_STUDIO_MONTHLY',
+    'PAYPAL_PLAN_STUDIO_YEARLY',
+    'BYOK_ENCRYPTION_KEY',
+    'RESEND_API_KEY',
+    'GEMINI_API_KEY',
+    'ICOUNT_API_TOKEN',
+    'TURNSTILE_SECRET_KEY',
+  ];
+  const missing = required.filter(k => !process.env[k]);
+  if (missing.length > 0) {
+    console.error(`FATAL: Missing required environment variables: ${missing.join(', ')}`);
+    process.exit(1);
+  }
+}
+
 async function startServer() {
+  validateEnv();
+  await initSentry();
   try {
     // Initialize watermark PNG for Free tier exports
     await initWatermark();
@@ -115,25 +153,59 @@ async function startServer() {
     const app = express();
     const PORT = 3000;
 
-  // Security headers — relaxed CSP in dev for Vite HMR, strict in production
+  // Sentry request handler must be the FIRST middleware so it wraps everything
+  app.use(Sentry.Handlers.requestHandler());
+
+  // Trust fly.io's proxy so express-rate-limit and req.ip use the real client IP,
+  // not the edge proxy IP. Single-hop proxy = 1.
+  app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : false);
+
+  // Security headers — relaxed CSP in dev for Vite HMR, strict in production.
+  // Production CSP must allow PayPal JS SDK, Cloudflare Turnstile, and Supabase realtime.
   const isDev = process.env.NODE_ENV !== 'production';
+  const supabaseHost = (process.env.SUPABASE_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
   app.use(helmet({
     crossOriginEmbedderPolicy: false,
     contentSecurityPolicy: isDev ? false : {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
+        scriptSrc: [
+          "'self'",
+          "https://www.paypal.com",
+          "https://www.paypalobjects.com",
+          "https://challenges.cloudflare.com",
+        ],
+        scriptSrcAttr: ["'unsafe-inline'"], // for the popup-return onclick handler
         styleSrc: ["'self'", "'unsafe-inline'"],
-        imgSrc: ["'self'", "data:", "blob:"],
-        connectSrc: ["'self'"],
-        fontSrc: ["'self'"],
+        imgSrc: [
+          "'self'",
+          "data:",
+          "blob:",
+          "https://www.paypalobjects.com",
+          "https://www.paypal.com",
+        ],
+        connectSrc: [
+          "'self'",
+          "https://api-m.paypal.com",
+          "https://www.paypal.com",
+          ...(supabaseHost ? [`https://${supabaseHost}`, `wss://${supabaseHost}`] : []),
+        ],
+        frameSrc: [
+          "'self'",
+          "https://www.paypal.com",
+          "https://challenges.cloudflare.com",
+        ],
+        fontSrc: ["'self'", "data:"],
         objectSrc: ["'none'"],
       },
     },
   }));
 
-  // CORS — restrict to explicit origins in production
-  const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'];
+  // CORS — restrict to explicit origins in production. validateEnv() already asserts ALLOWED_ORIGINS is set.
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
   app.use(cors({
     origin: process.env.NODE_ENV === 'production' ? allowedOrigins : true,
     credentials: true,
@@ -152,7 +224,10 @@ async function startServer() {
   const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false });
   const uploadLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: { error: 'Upload rate limit exceeded' } });
   const stackLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, message: { error: 'Processing rate limit exceeded' } });
+  // Auth registration: stricter limit — 10 attempts per hour per IP (CAPTCHA doesn't eliminate brute-force risk)
+  const authRegisterLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 10, message: { error: 'Too many registration attempts, please try again later' }, standardHeaders: true, legacyHeaders: false });
   app.use('/api', apiLimiter);
+  app.use('/api/auth/register', authRegisterLimiter);
 
   // Request logging middleware
   app.use((req, res, next) => {
@@ -174,10 +249,20 @@ async function startServer() {
   app.use('/api/api-keys', apiKeysRouter);
   app.use('/api/v1', v1Router);
   app.use('/api/settings/webhooks', webhooksRouter);
+  app.use('/api/admin', adminRouter);
 
-  // Health check
-  app.get("/api/ping", (_req, res) => {
-    res.json({ status: "ok", timestamp: new Date().toISOString() });
+  // Health check — verifies DB connectivity so fly.io can pull unhealthy VMs
+  // out of rotation when Supabase is unreachable.
+  app.get("/api/ping", async (_req, res) => {
+    try {
+      const { error } = await supabaseAdmin.from('profiles').select('id').limit(1);
+      if (error) {
+        return res.status(503).json({ status: 'unavailable', db: 'down', error: error.message, timestamp: new Date().toISOString() });
+      }
+      res.json({ status: 'ok', db: 'ok', timestamp: new Date().toISOString() });
+    } catch (err: any) {
+      res.status(503).json({ status: 'unavailable', db: 'down', error: err?.message, timestamp: new Date().toISOString() });
+    }
   });
 
   // Tier limits — returns limits for the current user's tier
@@ -189,6 +274,47 @@ async function startServer() {
   const uploadDir = path.join(process.cwd(), "uploads");
   if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
+  }
+
+  // Upload directory sweep — remove stale files from crashed requests.
+  // Runs on startup and hourly. 6h threshold covers the longest realistic
+  // processing time (large RAW batches) without letting orphans pile up.
+  const UPLOAD_STALE_MS = 6 * 60 * 60 * 1000;
+  function sweepUploads() {
+    try {
+      const now = Date.now();
+      for (const name of fs.readdirSync(uploadDir)) {
+        const fp = path.join(uploadDir, name);
+        try {
+          const stat = fs.statSync(fp);
+          if (stat.isFile() && now - stat.mtimeMs > UPLOAD_STALE_MS) {
+            fs.unlinkSync(fp);
+            log.info({ file: name }, 'Removed stale upload');
+          }
+        } catch (_) { /* race: file deleted mid-sweep — ignore */ }
+      }
+    } catch (err: any) {
+      log.warn({ err: err.message }, 'Upload sweep failed');
+    }
+  }
+  sweepUploads();
+  setInterval(sweepUploads, 60 * 60 * 1000).unref();
+
+  // Background workers — run every 5 min. unref() so they never block shutdown.
+  if (process.env.NODE_ENV === 'production') {
+    setInterval(() => {
+      runEmailRetry().catch((err) => log.warn({ err: err.message }, 'Email retry worker errored'));
+      processPendingReceipts().catch((err) => log.warn({ err: err.message }, 'Receipt retry worker errored'));
+    }, 5 * 60 * 1000).unref();
+
+    // Past-due cleanup runs once a day. Offset by 10 min from startup so we
+    // never block the first health check.
+    setTimeout(() => {
+      runPastDueCleanup().catch((err) => log.warn({ err: err.message }, 'Past-due cleanup errored'));
+      setInterval(() => {
+        runPastDueCleanup().catch((err) => log.warn({ err: err.message }, 'Past-due cleanup errored'));
+      }, 24 * 60 * 60 * 1000).unref();
+    }, 10 * 60 * 1000).unref();
   }
 
   const storage = multer.diskStorage({
@@ -578,17 +704,71 @@ async function startServer() {
     }
   });
 
+  /**
+   * AI-guided sharpening pipeline.
+   * Chain: AI analysis → NL-Means Denoise → Blind Deconvolution → Guided Filter → CLAHE → Ringing Suppression
+   * Optional AI final pass when pipeline might introduce artifacts.
+   */
+  app.post("/api/sharpen", stackLimiter, optionalAuth, checkAICredits, async (req: AuthenticatedRequest, res) => {
+    try {
+      const { image } = req.body; // { base64, mimeType }
+      if (!image?.base64 || !image?.mimeType) {
+        return res.status(400).json({ error: 'Missing image data (base64 + mimeType required)' });
+      }
+
+      const provider = getAIProvider(req) || getFallbackProvider();
+
+      // Step 1: AI analyzes the image and returns optimal pipeline parameters
+      let params = DEFAULT_SHARPEN_PARAMS;
+      try {
+        params = await provider.analyzeForSharpening(image);
+        log.info({ params, provider: (req as any)._aiProviderName }, 'sharpen: AI analysis complete');
+      } catch (analysisErr) {
+        // Non-fatal — fall back to conservative defaults rather than failing the request
+        log.warn({ err: analysisErr }, 'sharpen: AI analysis failed, using defaults');
+      }
+
+      // Steps 2–6: OpenCV algorithmic pipeline
+      let result = await sharpenImage(image.base64, image.mimeType, params);
+
+      // Step 7: Optional AI final correction (only if AI requested it)
+      if (params.needs_ai_pass && params.ai_pass_prompt) {
+        try {
+          const imageInput = { base64: result.replace(/^data:image\/\w+;base64,/, ''), mimeType: 'image/jpeg' };
+          const aiResult = await provider.editImage(
+            result,
+            [image],
+            params.ai_pass_prompt + ' Keep corrections minimal. Do not alter composition or colors.',
+          );
+          result = aiResult.image;
+          log.info({ provider: (req as any)._aiProviderName }, 'sharpen: AI final pass complete');
+        } catch (finalErr) {
+          // Non-fatal — use the algorithmic result if AI pass fails
+          log.warn({ err: finalErr }, 'sharpen: AI final pass failed, using algorithmic result');
+        }
+      }
+
+      res.json({ image: result });
+    } catch (error: any) {
+      log.error({ err: error, provider: (req as any)._aiProviderName }, 'Sharpen error');
+      res.status(500).json({ error: error.message || 'Sharpening failed' });
+    }
+  });
+
   // API Catch-all
   app.all("/api/*", (req, res) => {
     log.info(`404 API Route: ${req.method} ${req.url}`);
     res.status(404).json({ error: `API route not found: ${req.method} ${req.url}` });
   });
 
+  // Sentry error handler must come BEFORE our catch-all so Sentry sees errors first
+  app.use(Sentry.Handlers.errorHandler());
+
   // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     log.error({ err }, 'Unhandled server error');
-    res.status(500).json({ 
-      error: "Internal server error", 
+    res.status(500).json({
+      error: "Internal server error",
       message: err.message,
       stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
     });

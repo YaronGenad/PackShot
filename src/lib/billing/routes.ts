@@ -5,6 +5,7 @@
  */
 
 import { Router, Request, Response } from 'express';
+import pino from 'pino';
 import { supabaseAdmin, updateUserTier, getProfile } from '../db/supabase.js';
 import { authMiddleware, AuthenticatedRequest } from '../auth/middleware.js';
 import { addPurchasedCredits } from '../credits/ai-credits.js';
@@ -17,9 +18,11 @@ import {
   createOrder,
   captureOrder,
   verifyWebhookSignature,
+  reviseSubscription,
 } from './paypal.js';
 import { createReceipt } from '../invoicing/icount.js';
 
+const log = pino({ level: 'info' });
 const router = Router();
 
 /** Map tier + interval to PayPal Plan IDs from env. */
@@ -83,7 +86,7 @@ router.post('/create-checkout', authMiddleware, async (req: AuthenticatedRequest
 
     res.json({ url: approvalUrl });
   } catch (err: any) {
-    console.error('create-checkout error:', err);
+    log.error({ err }, 'create-checkout error');
     res.status(500).json({ error: 'Failed to create checkout session', details: err.message });
   }
 });
@@ -121,7 +124,7 @@ router.post('/buy-credits', authMiddleware, async (req: AuthenticatedRequest, re
 
     res.json({ url: approvalUrl });
   } catch (err: any) {
-    console.error('buy-credits error:', err);
+    log.error({ err }, 'buy-credits error');
     res.status(500).json({ error: 'Failed to create credit checkout', details: err.message });
   }
 });
@@ -149,7 +152,7 @@ router.post('/remove-watermark', authMiddleware, async (req: AuthenticatedReques
 
     res.json({ url: approvalUrl });
   } catch (err: any) {
-    console.error('remove-watermark error:', err);
+    log.error({ err }, 'remove-watermark error');
     res.status(500).json({ error: 'Failed to create checkout session', details: err.message });
   }
 });
@@ -217,7 +220,7 @@ router.post('/capture-order', authMiddleware, async (req: AuthenticatedRequest, 
 
     res.json({ success: true });
   } catch (err: any) {
-    console.error('capture-order error:', err);
+    log.error({ err }, 'capture-order error');
     res.status(500).json({ error: 'Failed to capture order', details: err.message });
   }
 });
@@ -239,15 +242,33 @@ router.post('/webhook', async (req: Request, res: Response) => {
       const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
       const valid = await verifyWebhookSignature(headers, rawBody, webhookId);
       if (!valid) {
-        console.error('PayPal webhook signature verification failed');
+        log.error('PayPal webhook signature verification failed');
         return res.status(400).json({ error: 'Invalid webhook signature' });
       }
     }
 
     const event = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     const eventType = event.event_type;
+    const eventId = event.id as string | undefined;
 
-    console.log(`PayPal webhook: ${eventType}`, event.id);
+    log.info({ eventType, eventId }, 'PayPal webhook received');
+
+    // Idempotency: PayPal retries on any non-2xx. Dedupe by event_id so we
+    // never double-credit credits, double-grant referrals, or double-bill iCount.
+    if (eventId) {
+      const { error: dupErr } = await supabaseAdmin
+        .from('processed_webhooks')
+        .insert({ event_id: eventId, event_type: eventType });
+      if (dupErr) {
+        if (dupErr.code === '23505') {
+          log.info({ eventId, eventType }, 'Webhook already processed — skipping');
+          return res.json({ received: true, deduped: true });
+        }
+        // DB error — log but keep processing. Returning 500 would make PayPal retry,
+        // which risks double-processing if the failing insert was actually a race.
+        log.error({ err: dupErr, eventId }, 'processed_webhooks insert failed');
+      }
+    }
 
     switch (eventType) {
       case 'BILLING.SUBSCRIPTION.ACTIVATED':
@@ -277,7 +298,7 @@ router.post('/webhook', async (req: Request, res: Response) => {
 
     res.json({ received: true });
   } catch (err: any) {
-    console.error('Webhook processing failed:', err);
+    log.error({ err }, 'Webhook processing failed');
     res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
@@ -289,6 +310,54 @@ router.get('/portal', authMiddleware, async (req: AuthenticatedRequest, res: Res
   // PayPal doesn't have a hosted portal like Stripe.
   // Redirect to PayPal auto-pay management page.
   res.json({ url: 'https://www.paypal.com/myaccount/autopay' });
+});
+
+/**
+ * POST /api/billing/change-plan — Switch between Pro and Studio (PayPal revise API).
+ * Body: { tier: 'pro' | 'studio', interval: 'month' | 'year' }
+ * Returns a PayPal approval URL the user must visit.
+ */
+router.post('/change-plan', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const user = req.user!;
+    const { tier, interval = 'month' } = req.body;
+
+    if (!['pro', 'studio'].includes(tier)) {
+      return res.status(400).json({ error: 'Invalid tier. Must be "pro" or "studio".' });
+    }
+
+    const newPlanId = getPlanId(tier, interval);
+    if (!newPlanId) {
+      return res.status(500).json({ error: `Plan not configured for ${tier}/${interval}` });
+    }
+
+    const { data: sub } = await supabaseAdmin
+      .from('subscriptions')
+      .select('paypal_subscription_id')
+      .eq('user_id', user.id)
+      .eq('status', 'active')
+      .not('paypal_subscription_id', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (!sub?.paypal_subscription_id) {
+      return res.status(400).json({ error: 'No active subscription to change. Subscribe first.' });
+    }
+
+    const appUrl = process.env.APP_URL || 'http://localhost:3000';
+    const { approvalUrl } = await reviseSubscription(
+      sub.paypal_subscription_id,
+      newPlanId,
+      `${appUrl}/?plan-changed=success`,
+      `${appUrl}/?plan-changed=cancelled`,
+    );
+
+    res.json({ url: approvalUrl });
+  } catch (err: any) {
+    log.error({ err }, 'change-plan error');
+    res.status(500).json({ error: 'Failed to change plan', details: err.message });
+  }
 });
 
 /**
@@ -323,7 +392,7 @@ router.post('/cancel', authMiddleware, async (req: AuthenticatedRequest, res: Re
 
     res.json({ success: true, message: 'Subscription cancelled' });
   } catch (err: any) {
-    console.error('cancel error:', err);
+    log.error({ err }, 'cancel error');
     res.status(500).json({ error: 'Failed to cancel subscription', details: err.message });
   }
 });
@@ -419,7 +488,7 @@ router.post('/sync', authMiddleware, async (req: AuthenticatedRequest, res: Resp
       res.json({ synced: false, message: `PayPal subscription status: ${ppSub.status}` });
     }
   } catch (err: any) {
-    console.error('sync error:', err);
+    log.error({ err }, 'sync error');
     res.status(500).json({ error: 'Sync failed', details: err.message });
   }
 });
@@ -439,16 +508,21 @@ async function processOneTimePayment(customId: string) {
       await addPurchasedCredits(userId, credits);
       const profile = await getProfile(userId);
       if (profile?.email) {
-        sendCreditsPurchasedEmail(profile.email, credits).catch(() => {});
+        sendCreditsPurchasedEmail(profile.email, credits).catch((err) => {
+          log.error({ err }, 'Failed to send credits purchased email');
+        });
         const packInfo = CREDIT_PACK_PRICES[pack];
         if (packInfo) {
           createReceipt({
+            userId,
             customerEmail: profile.email,
             customerName: profile.name,
             amount: parseFloat(packInfo.price),
             currency: 'USD',
             description: `PackShot AI Credits (${credits})`,
-          }).catch(() => {});
+          }).catch((err) => {
+            log.error({ err, userId, credits }, 'Failed to create iCount receipt for credit purchase');
+          });
         }
       }
     }
@@ -463,12 +537,15 @@ async function processOneTimePayment(customId: string) {
     if (profile?.email) {
       const launchPromo = process.env.WATERMARK_LAUNCH_PROMO !== 'false';
       createReceipt({
+        userId,
         customerEmail: profile.email,
         customerName: profile.name,
         amount: launchPromo ? 1 : 2,
         currency: 'USD',
         description: 'PackShot Watermark Removal',
-      }).catch(() => {});
+      }).catch((err) => {
+        log.error({ err, userId }, 'Failed to create iCount receipt for watermark removal');
+      });
     }
   }
 }
@@ -484,7 +561,7 @@ async function handleSubscriptionActivated(resource: any) {
   const userId = customId; // For subscriptions, custom_id is just the userId
   const tier = tierFromPlanId(planId);
   if (!tier) {
-    console.error(`Unknown plan ID: ${planId}`);
+    log.error({ planId }, 'Unknown PayPal plan ID in webhook');
     return;
   }
 
@@ -578,7 +655,9 @@ async function handleSubscriptionActivated(resource: any) {
 
   // Send subscription confirmation email + issue receipt
   if (profile?.email) {
-    sendSubscriptionConfirmedEmail(profile.email, tier).catch(() => {});
+    sendSubscriptionConfirmedEmail(profile.email, tier).catch((err) => {
+      log.error({ err }, 'Failed to send subscription confirmed email');
+    });
 
     // Determine subscription price for receipt
     const priceMap: Record<string, number> = {
@@ -590,12 +669,15 @@ async function handleSubscriptionActivated(resource: any) {
     const subPrice = priceMap[planId];
     if (subPrice) {
       createReceipt({
+        userId,
         customerEmail: profile.email,
         customerName: profile.name,
         amount: subPrice,
         currency: 'USD',
         description: `PackShot ${tier.charAt(0).toUpperCase() + tier.slice(1)} Subscription`,
-      }).catch(() => {});
+      }).catch((err) => {
+        log.error({ err, tier }, 'Failed to create iCount receipt for subscription');
+      });
     }
   }
 }
@@ -645,7 +727,9 @@ async function handleSubscriptionCancelled(resource: any) {
 
     // Send cancellation email
     if (profile?.email) {
-      sendSubscriptionCancelledEmail(profile.email, profile.tier || 'pro', 'now').catch(() => {});
+      sendSubscriptionCancelledEmail(profile.email, profile.tier || 'pro', 'now').catch((err) => {
+        log.error({ err }, 'Failed to send subscription cancelled email');
+      });
     }
   }
 }
@@ -711,7 +795,7 @@ async function handlePaymentCompleted(resource: any) {
         .eq('paypal_subscription_id', subscriptionId);
     }
   } catch (err) {
-    console.error('Failed to update period dates after payment:', err);
+    log.error({ err }, 'Failed to update period dates after payment');
   }
 }
 
@@ -730,7 +814,7 @@ async function handleOrderApproved(resource: any) {
       await processOneTimePayment(customId);
     }
   } catch (err) {
-    console.error('Failed to capture order from webhook:', err);
+    log.error({ err }, 'Failed to capture order from webhook');
   }
 }
 

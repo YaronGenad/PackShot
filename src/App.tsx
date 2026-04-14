@@ -11,9 +11,10 @@ import { BYOKSettings } from './components/BYOKSettings';
 import { LegalPages } from './components/LegalPages';
 import { RewardsPage } from './components/RewardsPage';
 import { AuthModal } from './components/AuthModal';
+import { AdminDashboard } from './components/AdminDashboard';
 import { useAuth } from './lib/auth-context';
 
-type Page = 'home' | 'pricing' | 'account' | 'legal' | 'rewards';
+type Page = 'home' | 'pricing' | 'account' | 'legal' | 'rewards' | 'admin';
 
 export default function App() {
   const { user, refreshUser } = useAuth();
@@ -39,12 +40,22 @@ export default function App() {
   useEffect(() => {
     const handleNav = (e: any) => {
       const target = e.detail;
-      if (target === 'rewards' || target === 'pricing' || target === 'account' || target === 'legal' || target === 'home') {
+      if (['rewards', 'pricing', 'account', 'legal', 'home', 'admin'].includes(target)) {
         setPage(target);
       }
     };
     window.addEventListener('packshot:navigate', handleNav);
     return () => window.removeEventListener('packshot:navigate', handleNav);
+  }, []);
+
+  // Hash-routed admin dashboard (#admin) — server middleware enforces authorization
+  useEffect(() => {
+    const applyHash = () => {
+      if (window.location.hash === '#admin') setPage('admin');
+    };
+    applyHash();
+    window.addEventListener('hashchange', applyHash);
+    return () => window.removeEventListener('hashchange', applyHash);
   }, []);
 
   // Handle password reset token from URL hash (Supabase redirects with #access_token=...)
@@ -266,7 +277,17 @@ export default function App() {
 
       {/* Page Content */}
       <AnimatePresence mode="wait">
-        {page === 'pricing' ? (
+        {page === 'admin' ? (
+          <motion.main
+            key="admin"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="relative z-10"
+          >
+            <AdminDashboard />
+          </motion.main>
+        ) : page === 'pricing' ? (
           <motion.main
             key="pricing"
             initial={{ opacity: 0 }}
