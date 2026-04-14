@@ -29,8 +29,10 @@ export async function initSentry(): Promise<void> {
   }
 
   try {
+    // Reassembled at runtime so bundlers don't try to resolve the optional peer at build time
+    const pkg = ['@sentry', 'node'].join('/');
     // @ts-ignore — optional peer
-    const mod = await import('@sentry/node');
+    const mod = await import(pkg);
     sentryModule = mod as unknown as SentryModule;
     sentryModule.init({
       dsn,

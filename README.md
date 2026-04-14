@@ -27,13 +27,15 @@ Typical alignment precision: 0.15-0.30px reprojection error. Handles shifts up t
 
 **AI Synthesis** — Multi-provider (Gemini, OpenAI, Grok). Generates studio packshots with pure white background. Optional — works with your own API key (BYOK) or purchased credits.
 
-### RAW File Support
+### Input Formats
 
-Powered by [librawspeed](https://github.com/LibRaw/LibRaw) (LibRaw native addon). Supports:
+**RAW** — Powered by [librawspeed](https://github.com/LibRaw/LibRaw) (LibRaw native addon). Supports:
 
 Canon (CR2, CR3), Nikon (NEF, NRW), Sony (ARW, SRF, SR2), Adobe (DNG), Fujifilm (RAF), Olympus (ORF), Panasonic (RW2, RWL), Pentax (PEF, PTX), Samsung (SRW), Sigma (X3F), Hasselblad (3FR, FFF), Phase One (IIQ), Minolta (MRW), Mamiya (MEF), Leica, Kodak, Epson, and more.
 
-Also reads **PSD/PSB** files (Photoshop) via [ag-psd](https://github.com/nicktaras/ag-psd).
+**PSD/PSB** — Photoshop composites via [ag-psd](https://github.com/nicktaras/ag-psd).
+
+**JPG / PNG** — Standard 8-bit photos go through a direct Sharp decode path, bypassing librawspeed. Useful for users who already have processed product shots and want to run focus stacking or AI synthesis without re-exporting from RAW. Magic-byte validation rejects extension-spoofed uploads.
 
 ### Export Formats
 

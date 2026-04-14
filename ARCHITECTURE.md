@@ -2,28 +2,34 @@
 
 ## System Overview
 
-PackShot Studio converts camera RAW focus brackets (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PSD, and 20+ more formats) into sharp product packshots. Three processing methods: deterministic focus stacking (Quick/Aligned), and optional multi-provider AI synthesis (Gemini/OpenAI/Grok).
+PackShot Studio converts camera RAW focus brackets (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2, PSD, and 20+ more formats) as well as standard JPG/PNG photos into sharp product packshots. Three processing methods: deterministic focus stacking (Quick/Aligned), and optional multi-provider AI synthesis (Gemini/OpenAI/Grok).
 
 ## Pipeline
 
 ```
-RAW/PSD File Upload (multipart, max 100MB)
+RAW / PSD / JPG / PNG Upload (multipart, max 100MB per file)
     │
     ▼
-┌──────────────────────────────────────────┐
-│  POST /api/process-raw                    │
-│                                           │
-│  Strategy 1: librawspeed thumbnail        │
-│    └─ loadBuffer() → embedded JPEG (fast) │
-│  Strategy 2: librawspeed full decode      │
-│    └─ processImage() → JPEG (full RAW)    │
-│  Strategy 3: ag-psd (PSD files)           │
-│    └─ readPsd() → composite/layer RGBA    │
-│  Strategy 4: Sharp direct (fallback)      │
-│                                           │
-│  + Magic byte validation (anti-spoofing)  │
-│  + Sharp optimization (rotate, 2048px)    │
-└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  POST /api/process-raw                        │
+│                                               │
+│  Magic-byte validation (anti-spoofing):       │
+│    RAW   → TIFF/RIFF/FUJIFILM header check    │
+│    PSD   → 8BPS header check                  │
+│    JPG   → 0xFF 0xD8 header check             │
+│    PNG   → 0x89 0x50 0x4E 0x47 header check   │
+│                                               │
+│  Branch by extension:                         │
+│    PSD         → ag-psd composite → Sharp     │
+│    JPG / PNG   → Sharp direct decode (fast)   │
+│    RAW         → librawspeed thumbnail        │
+│                    └─ fallback: full decode   │
+│    Unknown     → Sharp fallback               │
+│                                               │
+│  All branches converge → 8-bit sRGB JPEG      │
+│  + auto-rotate + tier-based resize            │
+│  + re-encode JPEG q=80                        │
+└──────────────────────────────────────────────┘
     │
     ▼
   Base64 JPEG images sent to frontend

@@ -19,11 +19,11 @@ interface RawUploaderProps {
   onImagesProcessed: (images: ProcessedImage[]) => void;
 }
 
-const RAW_EXTENSIONS = ['.cr2','.cr3','.nef','.nrw','.arw','.srf','.sr2','.dng','.raf','.orf','.rw2','.rwl','.pef','.ptx','.srw','.x3f','.3fr','.fff','.iiq','.mrw','.mef','.mos','.kdc','.dcr','.raw','.rwz','.erf','.bay','.psd','.psb'];
+const SUPPORTED_EXTENSIONS = ['.cr2','.cr3','.nef','.nrw','.arw','.srf','.sr2','.dng','.raf','.orf','.rw2','.rwl','.pef','.ptx','.srw','.x3f','.3fr','.fff','.iiq','.mrw','.mef','.mos','.kdc','.dcr','.raw','.rwz','.erf','.bay','.psd','.psb','.jpg','.jpeg','.png'];
 const MAX_FILE_SIZE_MB = 100;
 
-/** Check if file has a supported RAW/PSD extension. */
-const isSupported = (name: string) => RAW_EXTENSIONS.some(ext => name.toLowerCase().endsWith(ext));
+/** Check if file has a supported RAW/PSD/JPG/PNG extension. */
+const isSupported = (name: string) => SUPPORTED_EXTENSIONS.some(ext => name.toLowerCase().endsWith(ext));
 
 const TIER_FILE_LIMITS = { free: 10, pro: 20, studio: 50 };
 
@@ -169,7 +169,7 @@ export const RawUploader: React.FC<RawUploaderProps> = ({ onImagesProcessed }) =
         }}
         className="group relative border-2 border-dashed border-white/10 hover:border-orange-500/50 rounded-2xl p-12 transition-all cursor-pointer bg-white/[0.02] hover:bg-white/[0.04] overflow-hidden"
         role="button"
-        aria-label="Upload RAW or PSD files"
+        aria-label="Upload RAW, PSD, JPG, or PNG files"
         tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click(); }}
       >
@@ -180,18 +180,18 @@ export const RawUploader: React.FC<RawUploaderProps> = ({ onImagesProcessed }) =
             <Upload className="w-8 h-8 text-gray-400 group-hover:text-orange-500" />
           </div>
           <div className="space-y-1">
-            <h3 className="text-lg font-medium text-white">Upload RAW Files</h3>
-            <p className="text-sm text-gray-500">Drag and drop or click to select camera RAW or PSD files</p>
-            <p className="text-[10px] text-gray-600 font-mono uppercase tracking-widest">Max {MAX_FILE_SIZE_MB}MB per file • CR2, CR3, NEF, ARW, DNG, RAF, PSD...</p>
+            <h3 className="text-lg font-medium text-white">Upload Photos</h3>
+            <p className="text-sm text-gray-500">Drag and drop camera RAW, PSD, JPG, or PNG files</p>
+            <p className="text-[10px] text-gray-600 font-mono uppercase tracking-widest">Max {MAX_FILE_SIZE_MB}MB per file • CR2, CR3, NEF, ARW, DNG, PSD, JPG, PNG...</p>
           </div>
           <input
             type="file"
             ref={fileInputRef}
             onChange={handleFileChange}
             multiple
-            accept={RAW_EXTENSIONS.join(',')}
+            accept={SUPPORTED_EXTENSIONS.join(',')}
             className="hidden"
-            aria-label="Select RAW files"
+            aria-label="Select image files"
           />
         </div>
       </div>

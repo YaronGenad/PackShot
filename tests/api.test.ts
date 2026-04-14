@@ -23,7 +23,12 @@ async function createTestPNG(width = 100, height = 100): Promise<string> {
 function createMultipartBody(filePath: string, fieldName = 'images') {
   const fileData = fs.readFileSync(filePath);
   const fileName = path.basename(filePath);
-  const boundary = '----TestBoundary' + Date.now();
+  return createMultipartBodyFromBuffer(fileData, fileName, fieldName);
+}
+
+/** Create a multipart body from an in-memory buffer (no disk fixture needed). */
+function createMultipartBodyFromBuffer(fileData: Buffer, fileName: string, fieldName = 'images') {
+  const boundary = '----TestBoundary' + Date.now() + Math.random().toString(36).slice(2, 8);
   const body = Buffer.concat([
     Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${fieldName}"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`),
     fileData,
@@ -131,6 +136,63 @@ describe('POST /api/process-raw', () => {
     });
     // Multer returns 400 or the handler returns 400
     expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+});
+
+describe('POST /api/process-raw — JPG/PNG input', () => {
+  it('accepts a JPG upload and returns a JPEG preview', async () => {
+    const jpgBuffer = await sharp({
+      create: { width: 800, height: 600, channels: 3, background: { r: 180, g: 100, b: 50 } },
+    }).jpeg({ quality: 85 }).toBuffer();
+
+    const { body, boundary } = createMultipartBodyFromBuffer(jpgBuffer, 'test.jpg');
+    const res = await fetch(`${API}/api/process-raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body,
+    });
+
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.images).toBeDefined();
+    expect(data.images.length).toBe(1);
+    expect(data.images[0].base64.length).toBeGreaterThan(100);
+    expect(data.images[0].mimeType).toBe('image/jpeg');
+  });
+
+  it('accepts a PNG upload and returns a JPEG preview', async () => {
+    const pngBuffer = await sharp({
+      create: { width: 800, height: 600, channels: 4, background: { r: 50, g: 200, b: 100, alpha: 1 } },
+    }).png().toBuffer();
+
+    const { body, boundary } = createMultipartBodyFromBuffer(pngBuffer, 'test.png');
+    const res = await fetch(`${API}/api/process-raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body,
+    });
+
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.images.length).toBe(1);
+    // Output is always JPEG regardless of input format (post-resize encode)
+    expect(data.images[0].mimeType).toBe('image/jpeg');
+  });
+
+  it('rejects a .jpg file with non-JPEG magic bytes (extension spoofing)', async () => {
+    // Random bytes don't start with 0xFF 0xD8 → should be rejected
+    const junkBuffer = Buffer.from('this is not an image, just text pretending to be a jpg');
+    const { body, boundary } = createMultipartBodyFromBuffer(junkBuffer, 'spoofed.jpg');
+    const res = await fetch(`${API}/api/process-raw`, {
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+      body,
+    });
+
+    // Server returns 422 with magic-byte error message
+    expect(res.status).toBe(422);
+    const data = await res.json();
+    expect(data.error).toMatch(/content doesn't match extension/i);
   });
 });
 

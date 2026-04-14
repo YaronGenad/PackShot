@@ -82,6 +82,9 @@ const RAW_EXTENSIONS = new Set([
   '.mos', '.kdc', '.dcr', '.raw', '.rwz', '.erf', '.bay',
 ]);
 
+/** Standard 8-bit image formats that bypass the RAW decode path and go straight to Sharp. */
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png']);
+
 // Disable sharp cache to save memory in constrained environments
 sharp.cache(false);
 sharp.concurrency(1);
@@ -107,6 +110,13 @@ function validateFileMagic(buffer: Buffer, ext: string): boolean {
   }
   if (ext === '.psd' || ext === '.psb') {
     return MAGIC_BYTES.psd.some(m => buffer.subarray(0, m.length).equals(m));
+  }
+  // Standard 8-bit images: reject extension-spoofed uploads by checking magic bytes
+  if (ext === '.jpg' || ext === '.jpeg') {
+    return MAGIC_BYTES.jpeg.some(m => buffer.subarray(0, m.length).equals(m));
+  }
+  if (ext === '.png') {
+    return MAGIC_BYTES.png.some(m => buffer.subarray(0, m.length).equals(m));
   }
   return true; // Unknown extension — let Sharp try to decode
 }
@@ -366,7 +376,8 @@ async function startServer() {
       const ext = path.extname(file.originalname).toLowerCase();
       const isRAW = RAW_EXTENSIONS.has(ext);
       const isPSD = ext === '.psd' || ext === '.psb';
-      log.info({ file: file.originalname, size: file.size, isRAW, isPSD }, 'Processing file');
+      const isImage = IMAGE_EXTENSIONS.has(ext);
+      log.info({ file: file.originalname, size: file.size, isRAW, isPSD, isImage }, 'Processing file');
 
       try {
         const buffer = fs.readFileSync(filePath);
@@ -401,6 +412,17 @@ async function startServer() {
             }
           } catch (e: any) {
             log.info(`[PSD] Failed for ${file.originalname}: ${e.message}`);
+          }
+        }
+
+        // JPG/PNG: direct Sharp decode — skips librawspeed entirely.
+        // Placed before RAW so 8-bit images don't waste a LibRaw attempt that's guaranteed to fail.
+        if (!previewBuffer && isImage) {
+          try {
+            previewBuffer = await sharp(buffer).jpeg({ quality: 90 }).toBuffer();
+            log.info(`[IMAGE DIRECT] Success for ${file.originalname}, size: ${previewBuffer.length}`);
+          } catch (e: any) {
+            log.warn(`[IMAGE DIRECT] Failed for ${file.originalname}: ${e.message}`);
           }
         }
 
