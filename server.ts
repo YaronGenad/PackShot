@@ -642,11 +642,14 @@ async function startServer() {
 
       res.json(result);
     } catch (error: any) {
-      log.error({ err: error }, 'Focus stack error');
+      // OpenCV WASM exceptions sometimes lack a `.message` — capture as much detail as possible
+      const detail = error?.message || error?.toString?.() || String(error);
+      log.error({ err: error, detail, stack: error?.stack }, 'Focus stack error');
       if (!res.headersSent) {
         res.status(500).json({
-          error: error.message || "Focus stacking failed",
+          error: detail || "Focus stacking failed",
           code: "PROCESSING_ERROR",
+          ...(process.env.NODE_ENV !== 'production' ? { stack: error?.stack } : {}),
         });
       }
     }

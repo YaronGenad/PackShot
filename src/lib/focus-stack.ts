@@ -23,15 +23,58 @@ let cvReady: Promise<void> | null = null;
 /** Wait for WASM runtime to initialize; cached after first call. */
 function ensureCV(): Promise<void> {
   if (!cvReady) {
-    cvReady = new Promise<void>((resolve) => {
-      if (cv.getBuildInformation) {
-        resolve();
-      } else {
-        cv.onRuntimeInitialized = () => resolve();
-      }
+    cvReady = new Promise<void>((resolve, reject) => {
+      // 30-second watchdog: if WASM doesn't signal ready, surface a real error
+      const timeout = setTimeout(() => {
+        reject(new Error('OpenCV WASM initialization timed out after 30s'));
+      }, 30000);
+      const done = () => { clearTimeout(timeout); resolve(); };
+      // Probe: some builds expose functions immediately, others need onRuntimeInitialized
+      try {
+        if (typeof cv.Mat === 'function') {
+          done();
+          return;
+        }
+      } catch (_) { /* fall through */ }
+      cv.onRuntimeInitialized = done;
     });
   }
   return cvReady;
+}
+
+/** Translate OpenCV WASM exceptions (which are often numeric pointers, not Error objects). */
+function cvError(e: any, stage: string): Error {
+  if (e instanceof Error) return new Error(`${stage}: ${e.message}`);
+  if (typeof e === 'number') {
+    // OpenCV.js throws Emscripten exception pointers. Try every known API to recover the message.
+    const cvAny = cv as any;
+    try {
+      // Emscripten's built-in decoder
+      if (typeof cvAny.getExceptionMessage === 'function') {
+        const msg = cvAny.getExceptionMessage(e);
+        if (msg) return new Error(`${stage}: ${msg}`);
+      }
+    } catch (_) {}
+    try {
+      // Newer opencv.js exposes Exception class
+      if (typeof cvAny.Exception === 'function') {
+        const exc = new cvAny.Exception(e);
+        const msg = exc.what?.() || exc.msg;
+        if (msg) return new Error(`${stage}: ${msg}`);
+      }
+    } catch (_) {}
+    try {
+      // Some builds expose decode on the Module
+      const mod = cvAny.Module || cvAny;
+      if (typeof mod.UTF8ToString === 'function') {
+        const msg = mod.UTF8ToString(e);
+        if (msg) return new Error(`${stage}: ${msg}`);
+      }
+    } catch (_) {}
+    return new Error(`${stage}: OpenCV exception ptr=${e}`);
+  }
+  if (typeof e === 'string') return new Error(`${stage}: ${e}`);
+  return new Error(`${stage}: ${JSON.stringify(e) || 'unknown OpenCV error'}`);
 }
 
 // ── Helper: decode base64 image to cv.Mat (RGBA) ────────────────────────────
@@ -144,30 +187,78 @@ export async function performFocusStack(
 
   // ── Stage 0: Init OpenCV ────────────────────────────────────────────────
   let t = Date.now();
-  await ensureCV();
+  try { await ensureCV(); } catch (e) { throw cvError(e, 'OpenCV init'); }
   stagesMs.initialization = Date.now() - t;
 
-  // ── Stage 1: Decode all images ──────────────────────────────────────────
+  // ── Stage 1a: Probe image dimensions (metadata-only, no full decode) ────
+  // Users often upload phone shots with slightly different resolutions. We auto-normalize
+  // them to a shared dimension (the smallest common W×H) before decoding to pixels.
   t = Date.now();
+  const metas: { width: number; height: number }[] = [];
+  for (let i = 0; i < images.length; i++) {
+    const buf = Buffer.from(images[i].base64, 'base64');
+    const meta = await sharp(buf).metadata();
+    if (!meta.width || !meta.height) {
+      throw new Error(`Image ${i} (${images[i].name || 'unnamed'}): could not read dimensions. File may be corrupted.`);
+    }
+    metas.push({ width: meta.width, height: meta.height });
+  }
+  let targetW = Math.min(...metas.map(m => m.width));
+  let targetH = Math.min(...metas.map(m => m.height));
+  // OpenCV WASM heap is limited. AKAZE + Homography + warp on 8192px images with 3+ frames
+  // routinely blows the heap (~180MB per RGBA Mat at 8192×5460). Cap the alignment pass at 4096px;
+  // this preserves plenty of features for matching without exhausting WASM memory.
+  const MAX_STACK_DIM = 2048;
+  if (targetW > MAX_STACK_DIM || targetH > MAX_STACK_DIM) {
+    const scale = Math.min(MAX_STACK_DIM / targetW, MAX_STACK_DIM / targetH);
+    const originalW = targetW;
+    const originalH = targetH;
+    targetW = Math.round(targetW * scale);
+    targetH = Math.round(targetH * scale);
+    log.info({ originalW, originalH, targetW, targetH, scale }, 'Downscaling large images for focus stack (WASM memory limit)');
+  }
+  const needsResize = metas.some(m => m.width !== targetW || m.height !== targetH);
+  if (needsResize) {
+    log.info({ metas, targetW, targetH }, 'Normalizing mismatched image sizes before focus stack');
+  }
+
+  // ── Stage 1b: Decode all images (resizing to the common target if needed) ─
   const decoded: { mat: any; gray: any; width: number; height: number }[] = [];
   // Track all OpenCV objects for cleanup on error
   const allMats: any[] = [];
 
-  for (const img of images) {
-    const { mat, width, height } = await decodeImageToMat(img.base64);
-    allMats.push(mat);
-    if (width > 8192 || height > 8192) {
-      mat.delete();
-      throw new Error(`Image too large (${width}x${height}). Max 8192px per dimension.`);
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    try {
+      let rawBuf: Buffer;
+      if (metas[i].width !== targetW || metas[i].height !== targetH) {
+        // Resize to common dimensions (fill=cover so we don't introduce black bars that break alignment)
+        const resized = await sharp(Buffer.from(img.base64, 'base64'))
+          .resize(targetW, targetH, { fit: 'cover', position: 'center' })
+          .ensureAlpha()
+          .raw()
+          .toBuffer();
+        rawBuf = resized;
+      } else {
+        rawBuf = (await sharp(Buffer.from(img.base64, 'base64')).ensureAlpha().raw().toBuffer());
+      }
+
+      const mat = new cv.Mat(targetH, targetW, cv.CV_8UC4);
+      mat.data.set(rawBuf);
+      allMats.push(mat);
+      const gray = new cv.Mat();
+      allMats.push(gray);
+      cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+      decoded.push({ mat, gray, width: targetW, height: targetH });
+    } catch (e) {
+      // Clean up partially-decoded mats so we don't leak WASM heap on error
+      for (const m of allMats) { try { m.delete(); } catch (_) {} }
+      throw cvError(e, `decode image ${i} (${img.name || 'unnamed'})`);
     }
-    const gray = new cv.Mat();
-    allMats.push(gray);
-    cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
-    decoded.push({ mat, gray, width, height });
   }
 
-  const width = decoded[0].width;
-  const height = decoded[0].height;
+  const width = targetW;
+  const height = targetH;
 
   // ── Stage 2: Select reference image (highest global sharpness) ──────────
   t = Date.now();
@@ -175,26 +266,35 @@ export async function performFocusStack(
   let maxSharpness = -1;
   const sharpnessScores: number[] = [];
 
-  for (let i = 0; i < decoded.length; i++) {
-    const score = computeGlobalSharpness(decoded[i].gray);
-    sharpnessScores.push(score);
-    if (score > maxSharpness) {
-      maxSharpness = score;
-      refIdx = i;
+  try {
+    for (let i = 0; i < decoded.length; i++) {
+      const score = computeGlobalSharpness(decoded[i].gray);
+      sharpnessScores.push(score);
+      if (score > maxSharpness) {
+        maxSharpness = score;
+        refIdx = i;
+      }
     }
+  } catch (e) {
+    for (const m of allMats) { try { m.delete(); } catch (_) {} }
+    throw cvError(e, 'reference selection (Laplacian)');
   }
   stagesMs.referenceSelection = Date.now() - t;
   log.info({ refIdx, sharpness: maxSharpness.toFixed(2) }, 'Reference image selected');
 
   // ── Stage 3: Feature detection ──────────────────────────────────────────
   t = Date.now();
-  const detector = opts.detector === 'ORB' ? new cv.ORB() : new cv.AKAZE();
-
-  // Detect features on reference
+  let detector: any;
   const refKp = new cv.KeyPointVector();
   const refDesc = new cv.Mat();
   const emptyMask = new cv.Mat();
-  detector.detectAndCompute(decoded[refIdx].gray, emptyMask, refKp, refDesc);
+  try {
+    detector = opts.detector === 'ORB' ? new cv.ORB() : new cv.AKAZE();
+    detector.detectAndCompute(decoded[refIdx].gray, emptyMask, refKp, refDesc);
+  } catch (e) {
+    for (const m of allMats) { try { m.delete(); } catch (_) {} }
+    throw cvError(e, `feature detection on reference image (${opts.detector})`);
+  }
   log.info({ count: refKp.size() }, 'Reference features detected');
 
   // Detect features on all other images
